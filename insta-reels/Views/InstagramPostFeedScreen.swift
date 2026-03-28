@@ -24,10 +24,11 @@ struct InstagramPostFeedScreen: View {
     @Binding var visibleTransitionFrame: CGRect?
     let onClose: () -> Void
     var contentOpacity: Double = 1
+    var chromeOpacity: Double = 1
     var backgroundOpacity: Double = 1
     var isInteractionEnabled = true
-
-    @State private var hasScrolledToInitialPost = false
+    var isPresented = false
+    var presentationSequence = 0
 
     private let backgroundColor = Color.black
     private let secondaryTextColor = Color(red: 168.0 / 255.0, green: 173.0 / 255.0, blue: 184.0 / 255.0)
@@ -46,6 +47,7 @@ struct InstagramPostFeedScreen: View {
                                 InstagramPostFeedCard(
                                     post: post,
                                     isCurrentVisible: visiblePostID == post.id,
+                                    chromeOpacity: chromeOpacity,
                                     visibleTransitionContent: $visibleTransitionContent,
                                     visibleTransitionFrame: $visibleTransitionFrame
                                 )
@@ -60,26 +62,43 @@ struct InstagramPostFeedScreen: View {
                                     }
                             }
                         }
-                        .padding(.top, feedTopInset)
                         .padding(.bottom, 32)
+                    }
+                    .safeAreaInset(edge: .top, spacing: 0) {
+                        topBar
+                            .opacity(chromeOpacity)
                     }
                     .coordinateSpace(name: "feedScroll")
                     .scrollIndicators(.hidden)
                     .opacity(contentOpacity)
-                    .allowsHitTesting(isInteractionEnabled)
+                    .allowsHitTesting(isPresented && isInteractionEnabled)
                     .onAppear {
-                        guard hasScrolledToInitialPost == false else {
+                        guard isPresented else {
                             return
                         }
 
-                        hasScrolledToInitialPost = true
-                        visiblePostID = initialPostID
-
-                        DispatchQueue.main.async {
-                            proxy.scrollTo(initialPostID, anchor: .top)
+                        scrollToInitialPost(using: proxy)
+                    }
+                    .onChange(of: presentationSequence) { _, _ in
+                        guard isPresented else {
+                            return
                         }
+
+                        scrollToInitialPost(using: proxy)
+                    }
+                    .onChange(of: isPresented) { _, newValue in
+                        guard newValue else {
+                            visibleTransitionFrame = nil
+                            return
+                        }
+
+                        scrollToInitialPost(using: proxy)
                     }
                     .onPreferenceChange(FeedPostOffsetPreferenceKey.self) { offsets in
+                        guard isPresented else {
+                            return
+                        }
+
                         guard let closestPostID = currentVisiblePostID(
                             from: offsets,
                             viewportHeight: geometry.size.height,
@@ -93,6 +112,10 @@ struct InstagramPostFeedScreen: View {
                         }
                     }
                     .onPreferenceChange(FeedVisibleMediaFramePreferenceKey.self) { frames in
+                        guard isPresented else {
+                            return
+                        }
+
                         if let visiblePostID, let frame = frames[visiblePostID] {
                             visibleTransitionFrame = frame
                         } else {
@@ -100,10 +123,6 @@ struct InstagramPostFeedScreen: View {
                         }
                     }
                 }
-
-                topBar
-                    .opacity(contentOpacity)
-                    .allowsHitTesting(isInteractionEnabled)
             }
             .simultaneousGesture(edgeBackSwipeGesture)
         }
@@ -117,6 +136,14 @@ struct InstagramPostFeedScreen: View {
         return visibleOffsets.min { lhs, rhs in
             abs(lhs.value - topInset) < abs(rhs.value - topInset)
         }?.key
+    }
+
+    private func scrollToInitialPost(using proxy: ScrollViewProxy) {
+        visiblePostID = initialPostID
+
+        DispatchQueue.main.async {
+            proxy.scrollTo(initialPostID, anchor: .top)
+        }
     }
 
     private var topBar: some View {
@@ -175,6 +202,7 @@ struct InstagramPostFeedScreen: View {
 private struct InstagramPostFeedCard: View {
     let post: InstagramPost
     let isCurrentVisible: Bool
+    let chromeOpacity: Double
     @Binding var visibleTransitionContent: InstagramFeedTransitionContent?
     @Binding var visibleTransitionFrame: CGRect?
 
@@ -183,9 +211,12 @@ private struct InstagramPostFeedCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
+                .opacity(chromeOpacity)
             mediaPager
             actionRow
+                .opacity(chromeOpacity)
             metaSection
+                .opacity(chromeOpacity)
         }
     }
 
@@ -223,6 +254,7 @@ private struct InstagramPostFeedCard: View {
         .padding(.horizontal, 14)
     }
 
+    @ViewBuilder
     private var mediaPager: some View {
         FeedMediaPager(
             post: post,
