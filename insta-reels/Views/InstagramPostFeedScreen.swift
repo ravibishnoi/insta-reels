@@ -10,11 +10,18 @@ import Combine
 import SwiftUI
 import UIKit
 
+struct InstagramFeedTransitionContent: Equatable {
+    let postID: String
+    let media: InstagramMedia
+}
+
 struct InstagramPostFeedScreen: View {
     let title: String
     let posts: [InstagramPost]
     let initialPostID: String
     @Binding var visiblePostID: String?
+    @Binding var visibleTransitionContent: InstagramFeedTransitionContent?
+    @Binding var visibleTransitionFrame: CGRect?
     let onClose: () -> Void
     var contentOpacity: Double = 1
     var backgroundOpacity: Double = 1
@@ -36,7 +43,12 @@ struct InstagramPostFeedScreen: View {
                     ScrollView {
                         LazyVStack(spacing: 26) {
                             ForEach(posts) { post in
-                                InstagramPostFeedCard(post: post)
+                                InstagramPostFeedCard(
+                                    post: post,
+                                    isCurrentVisible: visiblePostID == post.id,
+                                    visibleTransitionContent: $visibleTransitionContent,
+                                    visibleTransitionFrame: $visibleTransitionFrame
+                                )
                                     .id(post.id)
                                     .background {
                                         GeometryReader { geometry in
@@ -78,6 +90,13 @@ struct InstagramPostFeedScreen: View {
 
                         if visiblePostID != closestPostID {
                             visiblePostID = closestPostID
+                        }
+                    }
+                    .onPreferenceChange(FeedVisibleMediaFramePreferenceKey.self) { frames in
+                        if let visiblePostID, let frame = frames[visiblePostID] {
+                            visibleTransitionFrame = frame
+                        } else {
+                            visibleTransitionFrame = frames.values.first
                         }
                     }
                 }
@@ -155,6 +174,9 @@ struct InstagramPostFeedScreen: View {
 
 private struct InstagramPostFeedCard: View {
     let post: InstagramPost
+    let isCurrentVisible: Bool
+    @Binding var visibleTransitionContent: InstagramFeedTransitionContent?
+    @Binding var visibleTransitionFrame: CGRect?
 
     private let secondaryTextColor = Color(red: 168.0 / 255.0, green: 173.0 / 255.0, blue: 184.0 / 255.0)
 
@@ -202,7 +224,12 @@ private struct InstagramPostFeedCard: View {
     }
 
     private var mediaPager: some View {
-        FeedMediaPager(post: post)
+        FeedMediaPager(
+            post: post,
+            isCurrentVisible: isCurrentVisible,
+            visibleTransitionContent: $visibleTransitionContent,
+            visibleTransitionFrame: $visibleTransitionFrame
+        )
     }
 
     private var actionRow: some View {
@@ -264,6 +291,9 @@ private struct InstagramPostFeedCard: View {
 
 private struct FeedMediaPager: View {
     let post: InstagramPost
+    let isCurrentVisible: Bool
+    @Binding var visibleTransitionContent: InstagramFeedTransitionContent?
+    @Binding var visibleTransitionFrame: CGRect?
 
     @State private var selectedPage = 0
     @State private var containerWidth = UIScreen.main.bounds.width
@@ -305,9 +335,24 @@ private struct FeedMediaPager: View {
                     .onChange(of: geometry.size.width) { _, newValue in
                         updateContainerWidth(newValue)
                     }
+                    .preference(
+                        key: FeedVisibleMediaFramePreferenceKey.self,
+                        value: isCurrentVisible
+                        ? [post.id: geometry.frame(in: .global)]
+                        : [:]
+                    )
             }
         }
         .clipped()
+        .onAppear {
+            syncVisibleTransitionContent()
+        }
+        .onChange(of: selectedPage) { _, _ in
+            syncVisibleTransitionContent()
+        }
+        .onChange(of: isCurrentVisible) { _, _ in
+            syncVisibleTransitionContent()
+        }
     }
 
     private var currentAspectRatio: CGFloat {
@@ -327,6 +372,21 @@ private struct FeedMediaPager: View {
 
         if abs(containerWidth - width) > 0.5 {
             containerWidth = width
+        }
+    }
+
+    private func syncVisibleTransitionContent() {
+        guard isCurrentVisible, post.media.indices.contains(selectedPage) else {
+            return
+        }
+
+        let content = InstagramFeedTransitionContent(
+            postID: post.id,
+            media: post.media[selectedPage]
+        )
+
+        if visibleTransitionContent != content {
+            visibleTransitionContent = content
         }
     }
 }
@@ -516,11 +576,19 @@ private struct FeedPostOffsetPreferenceKey: PreferenceKey {
     }
 }
 
+private struct FeedVisibleMediaFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
+    }
+}
+
 private struct FeedCircularAsyncImage: View {
     let url: URL?
 
     var body: some View {
-        AsyncImage(url: url) { phase in
+        CachedAsyncImage(url: url) { phase in
             switch phase {
             case let .success(image):
                 image
@@ -556,7 +624,7 @@ private struct FeedRectangularAsyncImage: View {
     let url: URL?
 
     var body: some View {
-        AsyncImage(url: url) { phase in
+        CachedAsyncImage(url: url) { phase in
             switch phase {
             case let .success(image):
                 image
@@ -597,6 +665,8 @@ struct InstagramPostFeedScreen_Previews: PreviewProvider {
             posts: Array(MockInstagramDataset.posts.prefix(6)),
             initialPostID: MockInstagramDataset.samplePost.id,
             visiblePostID: .constant(MockInstagramDataset.samplePost.id),
+            visibleTransitionContent: .constant(nil),
+            visibleTransitionFrame: .constant(nil),
             onClose: {}
         )
     }

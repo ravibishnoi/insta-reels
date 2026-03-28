@@ -6,9 +6,11 @@
 //
 
 import SwiftUI
+import UIKit
 
 struct InstagramProfileScreen: View {
     @ObservedObject var viewModel: InstagramProfileViewModel
+    @Namespace private var feedTransitionNamespace
     @State private var feedPresentation: InstagramFeedPresentation?
     @State private var currentFeedPostID: String?
     @State private var hiddenGridPostID: String?
@@ -17,16 +19,29 @@ struct InstagramProfileScreen: View {
     @State private var isTransitionHeroVisible = false
     @State private var isFeedTransitionExpanded = false
     @State private var isFeedContentVisible = false
+    @State private var feedBackgroundOpacity = 0.0
+    @State private var currentFeedTransitionContent: InstagramFeedTransitionContent?
+    @State private var currentFeedTransitionFrame: CGRect?
     @State private var isFeedInteractionEnabled = false
+    @State private var isFeedDismissInProgress = false
+    @State private var dismissSnapshotImage: UIImage?
+    @State private var dismissSnapshotFrame: CGRect = .zero
+    @State private var closingGridRevealPostID: String?
+    @State private var closingGridRevealOpacity = 0.0
     @State private var returningGridPostID: String?
     @State private var isGridReturnAnimationActive = false
     @State private var gridReturnAnimationSequence = 0
+    @State private var feedTransitionSequence = 0
 
     private let backgroundColor = Color(red: 10.0 / 255.0, green: 14.0 / 255.0, blue: 20.0 / 255.0)
     private let secondaryTextColor = Color(red: 166.0 / 255.0, green: 172.0 / 255.0, blue: 184.0 / 255.0)
     private let buttonColor = Color(red: 44.0 / 255.0, green: 49.0 / 255.0, blue: 58.0 / 255.0)
     private let dividerColor = Color.white.opacity(0.08)
     private let profileCoordinateSpaceName = "profileScreen"
+    private let feedTransitionFadeDuration = 0.18
+    private let feedTransitionDismissBackgroundFadeDuration = 0.24
+    private let feedTransitionInteractionDelay = 0.26
+    private let feedTransitionHeroCleanupDelay = 0.38
 
     var body: some View {
         GeometryReader { geometry in
@@ -92,6 +107,16 @@ struct InstagramProfileScreen: View {
                             proxy: proxy
                         )
                     }
+                }
+                .onChange(of: currentFeedPostID) { _, newPostID in
+                    guard feedPresentation != nil,
+                          isFeedDismissInProgress == false,
+                          let newPostID
+                    else {
+                        return
+                    }
+
+                    scrollProfileGrid(to: newPostID, using: proxy)
                 }
             }
         }
@@ -269,14 +294,11 @@ struct InstagramProfileScreen: View {
                     openFeed(for: item, model: model, containerSize: containerSize)
                 } label: {
                     ZStack(alignment: .topTrailing) {
-                        GridMediaCell(
-                            imageURL: item.imageURL,
-                            isReturningFromFeed: returningGridPostID == item.id,
-                            isReturnAnimationActive: returningGridPostID == item.id && isGridReturnAnimationActive
-                        )
-                        .opacity(hiddenGridPostID == item.id ? 0.001 : 1)
+                        gridMediaCell(for: item)
+                            .opacity(gridCellOpacity(for: item.id))
 
-                        if let overlaySymbol = item.overlaySymbol {
+                        if let overlaySymbol = item.overlaySymbol,
+                           hiddenGridPostID != item.id {
                             ZStack {
                                 RoundedRectangle(cornerRadius: 9, style: .continuous)
                                     .fill(Color.black.opacity(0.45))
@@ -296,7 +318,7 @@ struct InstagramProfileScreen: View {
                     GeometryReader { geometry in
                         Color.clear.preference(
                             key: GridItemFramePreferenceKey.self,
-                            value: [item.id: geometry.frame(in: .named(profileCoordinateSpaceName))]
+                            value: [item.id: geometry.frame(in: .global)]
                         )
                     }
                 }
@@ -317,31 +339,40 @@ struct InstagramProfileScreen: View {
         proxy: ScrollViewProxy
     ) -> some View {
         ZStack(alignment: .topLeading) {
-            Color.black
-                .opacity(1)
-                .ignoresSafeArea()
-
             InstagramPostFeedScreen(
                 title: presentation.title,
                 posts: presentation.posts,
                 initialPostID: presentation.initialPostID,
-                visiblePostID: $currentFeedPostID,
+                visiblePostID: visibleFeedPostIDBinding,
+                visibleTransitionContent: visibleFeedTransitionContentBinding,
+                visibleTransitionFrame: visibleFeedTransitionFrameBinding,
                 onClose: {
                     dismissFeed(using: proxy, presentation: presentation, containerSize: containerSize)
                 },
-                contentOpacity: isFeedContentVisible ? 1 : 0.001,
-                backgroundOpacity: 0,
+                contentOpacity: isFeedContentVisible ? 1 : 0,
+                backgroundOpacity: feedBackgroundOpacity,
                 isInteractionEnabled: isFeedInteractionEnabled
             )
 
             if let transitionHero {
                 InstagramFeedTransitionHero(
                     hero: transitionHero,
+                    namespace: feedTransitionNamespace,
                     isExpanded: isFeedTransitionExpanded,
-                    isVisible: isTransitionHeroVisible
+                    isVisible: isTransitionHeroVisible,
+                    containerSize: containerSize
                 )
                 .ignoresSafeArea()
                 .zIndex(2)
+            }
+
+            if let dismissSnapshotImage {
+                DismissTransitionSnapshot(
+                    image: dismissSnapshotImage,
+                    frame: dismissSnapshotFrame
+                )
+                .ignoresSafeArea()
+                .zIndex(3)
             }
         }
         .transition(.identity)
@@ -353,12 +384,18 @@ struct InstagramProfileScreen: View {
         model: InstagramProfileScreenModel,
         containerSize: CGSize
     ) {
+        let sequence = nextFeedTransitionSequence()
+
         clearGridReturnAnimation()
 
+        isFeedDismissInProgress = false
         currentFeedPostID = item.id
         hiddenGridPostID = item.id
+        closingGridRevealPostID = nil
+        closingGridRevealOpacity = 0
         isFeedTransitionExpanded = false
         isFeedContentVisible = false
+        feedBackgroundOpacity = 0
         isFeedInteractionEnabled = false
 
         let presentation = InstagramFeedPresentation(
@@ -367,11 +404,18 @@ struct InstagramProfileScreen: View {
             initialPostID: item.id
         )
 
+        currentFeedTransitionContent = presentation.posts
+            .first(where: { $0.id == item.id })
+            .flatMap { post in
+                post.media.first.map { media in
+                    InstagramFeedTransitionContent(postID: post.id, media: media)
+                }
+            }
+        currentFeedTransitionFrame = nil
+
         let hero = makeTransitionHero(
             for: item.id,
-            posts: presentation.posts,
-            collapsedFrame: gridItemFrames[item.id],
-            containerSize: containerSize
+            posts: presentation.posts
         )
 
         feedPresentation = presentation
@@ -381,28 +425,49 @@ struct InstagramProfileScreen: View {
         guard hero != nil else {
             isFeedTransitionExpanded = true
             isFeedContentVisible = true
+            feedBackgroundOpacity = 1
             isFeedInteractionEnabled = true
             return
         }
 
         DispatchQueue.main.async {
-            withAnimation(.interactiveSpring(response: 0.44, dampingFraction: 0.86, blendDuration: 0.14)) {
+            guard feedTransitionSequence == sequence else {
+                return
+            }
+
+            withAnimation(feedTransitionSpring) {
                 isFeedTransitionExpanded = true
+            }
+
+            withAnimation(feedTransitionFade) {
+                feedBackgroundOpacity = 1
             }
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-            withAnimation(.easeOut(duration: 0.12)) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + feedTransitionFadeDuration) {
+            guard feedTransitionSequence == sequence else {
+                return
+            }
+
+            withAnimation(feedTransitionFade) {
                 isFeedContentVisible = true
                 isTransitionHeroVisible = false
             }
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + feedTransitionInteractionDelay) {
+            guard feedTransitionSequence == sequence else {
+                return
+            }
+
             isFeedInteractionEnabled = true
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + feedTransitionHeroCleanupDelay) {
+            guard feedTransitionSequence == sequence else {
+                return
+            }
+
             transitionHero = nil
         }
     }
@@ -412,95 +477,343 @@ struct InstagramProfileScreen: View {
         presentation: InstagramFeedPresentation,
         containerSize: CGSize
     ) {
+        let sequence = nextFeedTransitionSequence()
         let restoreID = currentFeedPostID ?? presentation.initialPostID
 
+        isFeedDismissInProgress = true
         currentFeedPostID = restoreID
         hiddenGridPostID = restoreID
+        closingGridRevealPostID = restoreID
+        closingGridRevealOpacity = 0
         isFeedInteractionEnabled = false
 
-        withAnimation(.easeInOut(duration: 0.22)) {
-            proxy.scrollTo(restoreID, anchor: .center)
-        }
+        scrollProfileGrid(to: restoreID, using: proxy)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+        Task { @MainActor in
+            _ = await waitForGridFrame(
+                for: restoreID,
+                settlingAfterScroll: true
+            )
+
+            guard feedTransitionSequence == sequence else {
+                return
+            }
+
+            if let snapshot = captureTransitionSnapshot(),
+               let startFrame = currentFeedTransitionFrame,
+               let targetFrame = gridItemFrames[restoreID] {
+                transitionHero = nil
+                isTransitionHeroVisible = false
+                dismissSnapshotImage = snapshot
+                dismissSnapshotFrame = startFrame
+                isFeedContentVisible = false
+                feedBackgroundOpacity = 0
+
+                withAnimation(feedTransitionDismissSnapshotAnimation, completionCriteria: .logicallyComplete) {
+                    dismissSnapshotFrame = targetFrame
+                } completion: {
+                    guard feedTransitionSequence == sequence,
+                          closingGridRevealPostID == restoreID
+                    else {
+                        return
+                    }
+
+                    var transaction = Transaction()
+                    transaction.animation = nil
+
+                    withTransaction(transaction) {
+                        dismissSnapshotImage = nil
+                        dismissSnapshotFrame = .zero
+                        resetFeedPresentation()
+                    }
+                }
+                return
+            }
+
             let collapseHero = makeTransitionHero(
                 for: restoreID,
-                posts: presentation.posts,
-                collapsedFrame: gridItemFrames[restoreID],
-                containerSize: containerSize
+                posts: presentation.posts
             )
 
             guard let collapseHero else {
-                feedPresentation = nil
-                transitionHero = nil
-                isTransitionHeroVisible = false
-                isFeedTransitionExpanded = false
                 isFeedContentVisible = false
-                isFeedInteractionEnabled = false
-                hiddenGridPostID = nil
-                playGridReturnAnimation(for: restoreID)
+                feedBackgroundOpacity = 0
+                closingGridRevealOpacity = 1
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + feedTransitionDismissBackgroundFadeDuration) {
+                    guard feedTransitionSequence == sequence else {
+                        return
+                    }
+
+                    resetFeedPresentation(playGridReturnAnimationFor: restoreID)
+                }
                 return
             }
 
             transitionHero = collapseHero
             isTransitionHeroVisible = true
 
-            withAnimation(.easeOut(duration: 0.12)) {
-                isFeedContentVisible = false
-            }
-
-            withAnimation(.interactiveSpring(response: 0.42, dampingFraction: 0.84, blendDuration: 0.12)) {
-                isFeedTransitionExpanded = false
-            }
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.48) {
-            feedPresentation = nil
-            transitionHero = nil
-            isTransitionHeroVisible = false
-            isFeedTransitionExpanded = false
             isFeedContentVisible = false
-            isFeedInteractionEnabled = false
-            hiddenGridPostID = nil
+            feedBackgroundOpacity = 0
+            closingGridRevealOpacity = 0
+
+            withAnimation(feedTransitionDismissSpring, completionCriteria: .logicallyComplete) {
+                isFeedTransitionExpanded = false
+            } completion: {
+                guard feedTransitionSequence == sequence,
+                      closingGridRevealPostID == restoreID
+                else {
+                    return
+                }
+
+                var transaction = Transaction()
+                transaction.animation = nil
+
+                withTransaction(transaction) {
+                    resetFeedPresentation()
+                }
+            }
         }
+    }
+
+    @MainActor
+    private func waitForGridFrame(
+        for postID: String,
+        timeout: TimeInterval = 0.35,
+        settlingAfterScroll: Bool = false
+    ) async -> CGRect? {
+        if settlingAfterScroll {
+            try? await Task.sleep(for: .milliseconds(16))
+        } else if let frame = gridItemFrames[postID] {
+            return frame
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+
+        while Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(16))
+
+            if let frame = gridItemFrames[postID] {
+                return frame
+            }
+        }
+
+        return gridItemFrames[postID]
+    }
+
+    private func scrollProfileGrid(to postID: String, using proxy: ScrollViewProxy) {
+        var transaction = Transaction()
+        transaction.animation = nil
+
+        withTransaction(transaction) {
+            proxy.scrollTo(postID, anchor: .center)
+        }
+    }
+
+    private func nextFeedTransitionSequence() -> Int {
+        feedTransitionSequence += 1
+        return feedTransitionSequence
+    }
+
+    @ViewBuilder
+    private func gridMediaCell(for item: InstagramProfileGridItem) -> some View {
+        let cell = GridMediaCell(
+            imageURL: transitionImageURL(for: item),
+            isReturningFromFeed: returningGridPostID == item.id,
+            isReturnAnimationActive: returningGridPostID == item.id && isGridReturnAnimationActive
+        )
+
+        if transitionHero?.postID == item.id {
+            cell.matchedGeometryEffect(
+                id: item.id,
+                in: feedTransitionNamespace,
+                properties: .frame,
+                anchor: .center,
+                isSource: isFeedTransitionExpanded == false
+            )
+        } else {
+            cell
+        }
+    }
+
+    private func gridCellOpacity(for postID: String) -> Double {
+        guard hiddenGridPostID == postID else {
+            return 1
+        }
+
+        guard closingGridRevealPostID == postID else {
+            return 0.001
+        }
+
+        return max(closingGridRevealOpacity, 0.001)
+    }
+
+    private func transitionImageURL(for item: InstagramProfileGridItem) -> URL? {
+        guard let currentFeedTransitionContent,
+              currentFeedTransitionContent.postID == item.id
+        else {
+            return item.imageURL
+        }
+
+        return currentFeedTransitionContent.media.thumbnailURL ?? currentFeedTransitionContent.media.mediaURL
+    }
+
+    private func resetFeedPresentation(playGridReturnAnimationFor postID: String? = nil) {
+        feedPresentation = nil
+        transitionHero = nil
+        isTransitionHeroVisible = false
+        isFeedTransitionExpanded = false
+        isFeedContentVisible = false
+        feedBackgroundOpacity = 0
+        currentFeedTransitionContent = nil
+        currentFeedTransitionFrame = nil
+        isFeedInteractionEnabled = false
+        isFeedDismissInProgress = false
+        dismissSnapshotImage = nil
+        dismissSnapshotFrame = .zero
+        hiddenGridPostID = nil
+        closingGridRevealPostID = nil
+        closingGridRevealOpacity = 0
+
+        if let postID {
+            playGridReturnAnimation(for: postID)
+        }
+    }
+
+    private var feedTransitionSpring: Animation {
+        .interactiveSpring(response: 0.52, dampingFraction: 0.92, blendDuration: 0.18)
+    }
+
+    private var feedTransitionDismissSpring: Animation {
+        .interactiveSpring(response: 0.44, dampingFraction: 0.96, blendDuration: 0.08)
+    }
+
+    private var feedTransitionFade: Animation {
+        .easeOut(duration: feedTransitionFadeDuration)
+    }
+
+    private var feedTransitionDismissSnapshotAnimation: Animation {
+        .easeInOut(duration: 0.24)
+    }
+
+    private var visibleFeedPostIDBinding: Binding<String?> {
+        Binding(
+            get: { currentFeedPostID },
+            set: { newValue in
+                guard isFeedDismissInProgress == false else {
+                    return
+                }
+
+                currentFeedPostID = newValue
+            }
+        )
+    }
+
+    private var visibleFeedTransitionContentBinding: Binding<InstagramFeedTransitionContent?> {
+        Binding(
+            get: { currentFeedTransitionContent },
+            set: { newValue in
+                guard isFeedDismissInProgress == false else {
+                    return
+                }
+
+                currentFeedTransitionContent = newValue
+            }
+        )
+    }
+
+    private var visibleFeedTransitionFrameBinding: Binding<CGRect?> {
+        Binding(
+            get: { currentFeedTransitionFrame },
+            set: { newValue in
+                guard isFeedDismissInProgress == false else {
+                    return
+                }
+
+                currentFeedTransitionFrame = newValue
+            }
+        )
     }
 
     private func makeTransitionHero(
         for postID: String,
-        posts: [InstagramPost],
-        collapsedFrame: CGRect?,
-        containerSize: CGSize
+        posts: [InstagramPost]
     ) -> InstagramFeedTransitionHeroState? {
         guard let post = posts.first(where: { $0.id == postID }) else {
             return nil
         }
 
-        guard let collapsedFrame else {
+        guard let media = transitionMedia(for: post) else {
             return nil
         }
 
         return InstagramFeedTransitionHeroState(
-            imageURL: post.media.first?.thumbnailURL ?? post.media.first?.mediaURL,
-            collapsedFrame: collapsedFrame,
-            expandedFrame: feedHeroDestinationFrame(for: post, containerSize: containerSize)
+            postID: postID,
+            media: media
         )
     }
 
-    private func feedHeroDestinationFrame(for post: InstagramPost, containerSize: CGSize) -> CGRect {
+    private func transitionMedia(for post: InstagramPost) -> InstagramMedia? {
+        if let currentFeedTransitionContent, currentFeedTransitionContent.postID == post.id {
+            return currentFeedTransitionContent.media
+        }
+
+        return post.media.first
+    }
+
+    private func feedHeroDestinationFrame(for media: InstagramMedia, containerSize: CGSize) -> CGRect {
         let width = containerSize.width
-        let height = width / feedHeroAspectRatio(for: post)
+        let height = width / feedHeroAspectRatio(for: media)
         let minY: CGFloat = 124
 
         return CGRect(x: 0, y: minY, width: width, height: height)
     }
 
-    private func feedHeroAspectRatio(for post: InstagramPost) -> CGFloat {
-        guard let media = post.media.first else {
-            return 1
-        }
-
+    private func feedHeroAspectRatio(for media: InstagramMedia) -> CGFloat {
         let ratio = CGFloat(media.width) / CGFloat(max(media.height, 1))
         return min(max(ratio, 0.5625), 1.0)
+    }
+
+    @MainActor
+    private func captureTransitionSnapshot() -> UIImage? {
+        guard let frame = currentFeedTransitionFrame,
+              frame.width > 1,
+              frame.height > 1,
+              let windowScene = UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene })
+                .first(where: { $0.activationState == .foregroundActive }),
+              let window = windowScene.windows.first(where: \.isKeyWindow) ?? windowScene.windows.first
+        else {
+            return nil
+        }
+
+        let renderer = UIGraphicsImageRenderer(bounds: window.bounds)
+        let snapshot = renderer.image { _ in
+            window.drawHierarchy(in: window.bounds, afterScreenUpdates: false)
+        }
+
+        let scale = snapshot.scale
+        let imageBounds = CGRect(
+            x: 0,
+            y: 0,
+            width: snapshot.size.width * scale,
+            height: snapshot.size.height * scale
+        )
+        let cropRect = CGRect(
+            x: frame.minX * scale,
+            y: frame.minY * scale,
+            width: frame.width * scale,
+            height: frame.height * scale
+        ).integral.intersection(imageBounds)
+
+        guard cropRect.isNull == false,
+              cropRect.isEmpty == false,
+              let cgImage = snapshot.cgImage?.cropping(to: cropRect)
+        else {
+            return nil
+        }
+
+        return UIImage(cgImage: cgImage, scale: scale, orientation: .up)
     }
 
     private func playGridReturnAnimation(for postID: String) {
@@ -544,9 +857,8 @@ private struct InstagramFeedPresentation: Identifiable {
 }
 
 private struct InstagramFeedTransitionHeroState {
-    let imageURL: URL?
-    let collapsedFrame: CGRect
-    let expandedFrame: CGRect
+    let postID: String
+    let media: InstagramMedia
 }
 
 private struct GridItemFramePreferenceKey: PreferenceKey {
@@ -559,30 +871,66 @@ private struct GridItemFramePreferenceKey: PreferenceKey {
 
 private struct InstagramFeedTransitionHero: View {
     let hero: InstagramFeedTransitionHeroState
+    let namespace: Namespace.ID
     let isExpanded: Bool
     let isVisible: Bool
+    let containerSize: CGSize
 
     var body: some View {
-        let frame = isExpanded ? hero.expandedFrame : hero.collapsedFrame
-
-        RectangularAsyncImage(url: hero.imageURL)
-            .background(Color.white.opacity(0.04))
-        .frame(width: frame.width, height: frame.height)
-        .clipShape(
-            RoundedRectangle(
-                cornerRadius: isExpanded ? 0 : 2,
-                style: .continuous
+        InstagramTransitionHeroMedia(media: hero.media)
+            .matchedGeometryEffect(
+                id: hero.postID,
+                in: namespace,
+                properties: .frame,
+                anchor: .center,
+                isSource: isExpanded
             )
-        )
-        .shadow(
-            color: Color.black.opacity(isExpanded ? 0.18 : 0),
-            radius: isExpanded ? 26 : 0,
-            y: isExpanded ? 14 : 0
-        )
-        .position(x: frame.midX, y: frame.midY)
-        .opacity(isVisible ? 1 : 0)
-        .animation(.easeOut(duration: 0.12), value: isVisible)
-        .allowsHitTesting(false)
+            .frame(width: containerSize.width, height: mediaHeight)
+            .clipShape(
+                RoundedRectangle(
+                    cornerRadius: 0,
+                    style: .continuous
+                )
+            )
+            .shadow(
+                color: Color.black.opacity(isExpanded ? 0.12 : 0),
+                radius: isExpanded ? 18 : 0,
+                y: isExpanded ? 8 : 0
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .padding(.top, 124)
+            .opacity(isVisible ? 1 : 0)
+            .animation(.easeInOut(duration: 0.16), value: isVisible)
+            .allowsHitTesting(false)
+    }
+
+    private var mediaHeight: CGFloat {
+        let ratio = CGFloat(hero.media.width) / CGFloat(max(hero.media.height, 1))
+        let clampedRatio = min(max(ratio, 0.5625), 1.0)
+        return containerSize.width / clampedRatio
+    }
+}
+
+private struct DismissTransitionSnapshot: View {
+    let image: UIImage
+    let frame: CGRect
+
+    var body: some View {
+        Image(uiImage: image)
+            .resizable()
+            .scaledToFill()
+            .frame(width: frame.width, height: frame.height)
+            .clipped()
+            .position(x: frame.midX, y: frame.midY)
+            .allowsHitTesting(false)
+    }
+}
+
+private struct InstagramTransitionHeroMedia: View {
+    let media: InstagramMedia
+
+    var body: some View {
+        RectangularAsyncImage(url: media.thumbnailURL ?? media.mediaURL)
     }
 }
 
@@ -678,6 +1026,7 @@ private struct GridMediaCell: View {
     let imageURL: URL?
     let isReturningFromFeed: Bool
     let isReturnAnimationActive: Bool
+    private let instagramGridAspectRatio: CGFloat = 4.0 / 5.0
 
     var body: some View {
         Rectangle()
@@ -706,7 +1055,7 @@ private struct GridMediaCell: View {
                 .interactiveSpring(response: 0.42, dampingFraction: 0.84, blendDuration: 0.12),
                 value: isReturnAnimationActive
             )
-            .aspectRatio(1, contentMode: .fit)
+            .aspectRatio(instagramGridAspectRatio, contentMode: .fit)
     }
 
     private var cellShape: RoundedRectangle {
@@ -734,7 +1083,7 @@ private struct CircularAsyncImage: View {
     let url: URL?
 
     var body: some View {
-        AsyncImage(url: url) { phase in
+        CachedAsyncImage(url: url) { phase in
             switch phase {
             case let .success(image):
                 image
@@ -784,7 +1133,7 @@ private struct RectangularAsyncImage: View {
     let url: URL?
 
     var body: some View {
-        AsyncImage(url: url) { phase in
+        CachedAsyncImage(url: url) { phase in
             switch phase {
             case let .success(image):
                 image
@@ -793,7 +1142,7 @@ private struct RectangularAsyncImage: View {
 
             case .empty:
                 ZStack {
-                    Color.white.opacity(0.06)
+                    Color(red: 18.0 / 255.0, green: 22.0 / 255.0, blue: 30.0 / 255.0)
                     ProgressView()
                         .tint(.white)
                 }
@@ -810,8 +1159,8 @@ private struct RectangularAsyncImage: View {
     private var fallback: some View {
         LinearGradient(
             colors: [
-                Color.white.opacity(0.08),
-                Color.white.opacity(0.18)
+                Color(red: 20.0 / 255.0, green: 24.0 / 255.0, blue: 33.0 / 255.0),
+                Color(red: 32.0 / 255.0, green: 38.0 / 255.0, blue: 49.0 / 255.0)
             ],
             startPoint: .topLeading,
             endPoint: .bottomTrailing
