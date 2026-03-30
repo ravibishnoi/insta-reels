@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Xcode build artifacts
+DerivedData/
+.derived-data/
+build/
+
+# Xcode user-specific workspace state
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcuserstate
+
+# Codex local staging
+.codex-skill-staging/
