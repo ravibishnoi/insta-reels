@@ -15,7 +15,6 @@ struct InstagramProfileScreen: View {
     @State private var hiddenGridPostID: String?
     @State private var gridItemFrames: [String: CGRect] = [:]
     @State private var baseFeedOpacity = 1.0
-    @State private var isFeedContentVisible = false
     @State private var feedOverlayFrame: CGRect = .zero
     @State private var currentFeedTransitionContent: InstagramFeedTransitionContent?
     @State private var currentFeedTransitionFrame: CGRect?
@@ -35,6 +34,7 @@ struct InstagramProfileScreen: View {
     private let buttonColor = Color(red: 44.0 / 255.0, green: 49.0 / 255.0, blue: 58.0 / 255.0)
     private let dividerColor = Color.white.opacity(0.08)
     private let dimmedFeedOpacity = 0.3
+    private let feedInteractionEnableDelay = 0.18
 
     var body: some View {
         GeometryReader { geometry in
@@ -102,16 +102,6 @@ struct InstagramProfileScreen: View {
                             proxy: proxy
                         )
                     }
-                }
-                .onChange(of: currentFeedPostID) { _, newPostID in
-                    guard feedPresentation != nil,
-                          isFeedDismissInProgress == false,
-                          let newPostID
-                    else {
-                        return
-                    }
-
-                    scrollProfileGrid(to: newPostID, using: proxy)
                 }
             }
         }
@@ -337,6 +327,10 @@ struct InstagramProfileScreen: View {
     ) -> some View {
         let fullScreenFrame = fullScreenFeedFrame(fallbackSize: containerSize)
         let overlayFrame = resolvedFeedOverlayFrame(fallback: fullScreenFrame)
+        let chromeOpacity = feedChromeOpacity(
+            overlayFrame: overlayFrame,
+            fullScreenFrame: fullScreenFrame
+        )
 
         return InstagramPostFeedScreen(
             title: title,
@@ -349,11 +343,10 @@ struct InstagramProfileScreen: View {
                 dismissFeed(using: proxy, posts: posts)
             },
             contentOpacity: feedPresentation != nil ? 1 : 0,
-            chromeOpacity: isFeedContentVisible ? 1 : 0,
+            chromeOpacity: chromeOpacity,
             backgroundOpacity: feedPresentation != nil ? 1 : 0,
             isInteractionEnabled: isFeedInteractionEnabled,
-            isPresented: feedPresentation != nil,
-            presentationSequence: feedTransitionSequence
+            isPresented: feedPresentation != nil
         )
         .frame(width: fullScreenFrame.width, height: fullScreenFrame.height, alignment: .topLeading)
         .scaleEffect(
@@ -397,7 +390,6 @@ struct InstagramProfileScreen: View {
         closingGridRevealPostID = nil
         closingGridRevealOpacity = 0
         baseFeedOpacity = 1
-        isFeedContentVisible = false
         feedOverlayFrame = sourceFrame
         isFeedInteractionEnabled = false
 
@@ -426,7 +418,22 @@ struct InstagramProfileScreen: View {
             cleanupTransaction.animation = nil
 
             withTransaction(cleanupTransaction) {
-                isFeedContentVisible = true
+                isFeedInteractionEnabled = true
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + feedInteractionEnableDelay) {
+            guard feedTransitionSequence == sequence,
+                  feedPresentation != nil,
+                  isFeedDismissInProgress == false
+            else {
+                return
+            }
+
+            var transaction = Transaction()
+            transaction.animation = nil
+
+            withTransaction(transaction) {
                 isFeedInteractionEnabled = true
             }
         }
@@ -486,7 +493,6 @@ struct InstagramProfileScreen: View {
                 preparationTransaction.animation = nil
 
                 withTransaction(preparationTransaction) {
-                    isFeedContentVisible = false
                     dismissSnapshotImage = snapshot
                     dismissSnapshotFrame = startFrame
                 }
@@ -517,7 +523,6 @@ struct InstagramProfileScreen: View {
             preparationTransaction.animation = nil
 
             withTransaction(preparationTransaction) {
-                isFeedContentVisible = false
                 feedOverlayFrame = currentFeedTransitionFrame ?? fullScreenFeedFrame(fallbackSize: UIScreen.main.bounds.size)
             }
 
@@ -613,7 +618,6 @@ struct InstagramProfileScreen: View {
     private func resetFeedPresentation(playGridReturnAnimationFor postID: String? = nil) {
         feedPresentation = nil
         baseFeedOpacity = 1
-        isFeedContentVisible = false
         feedOverlayFrame = .zero
         currentFeedTransitionContent = nil
         currentFeedTransitionFrame = nil
@@ -703,6 +707,18 @@ struct InstagramProfileScreen: View {
         }
 
         return feedOverlayFrame
+    }
+
+    private func feedChromeOpacity(overlayFrame: CGRect, fullScreenFrame: CGRect) -> Double {
+        guard feedPresentation != nil,
+              dismissSnapshotImage == nil
+        else {
+            return 0
+        }
+
+        let widthProgress = overlayFrame.width / max(fullScreenFrame.width, 1)
+        let normalizedProgress = (widthProgress - 0.56) / 0.3
+        return min(max(normalizedProgress, 0), 1)
     }
 
     private func transitionContent(

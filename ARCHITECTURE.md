@@ -47,7 +47,7 @@ flowchart TD
 - `insta-reels/Views/InstagramProfileScreen.swift`
   Main profile UI, profile grid, single-hierarchy feed overlay coordination, live open transition, snapshot-based close transition, and return-to-grid behavior.
 - `insta-reels/Views/InstagramPostFeedScreen.swift`
-  Always-mounted post overlay content, visible post tracking, visible media tracking, gesture-based close, inline media paging, and chrome fading around the live media transition.
+  Always-mounted post overlay content, compact fixed `Posts` top bar, feed scrolling below that bar, visible post tracking, visible media tracking, gesture-based close, inline media paging, and chrome fading around the live media transition.
 
 ### Shared UI/media helpers
 - `insta-reels/Views/CachedAsyncImage.swift`
@@ -122,7 +122,8 @@ It owns:
 
 `InstagramPostFeedScreen` owns:
 - feed layout and scrolling
-- top bar and close gesture
+- compact fixed `Posts` top bar and back button
+- keeping the active post header directly below the top bar
 - visible post detection
 - visible media frame reporting
 - media pager state per feed card
@@ -146,7 +147,7 @@ Feed open flow:
 2. `InstagramProfileScreen` records the tapped grid cell frame and sets feed presentation state.
 3. `InstagramPostFeedScreen` is already in the same root `ZStack`, so there is no navigation or screen push.
 4. The live feed overlay itself animates from the tapped cell frame to the full-screen frame.
-5. Feed chrome fades in only after the motion completes in a non-animated cleanup step.
+5. Feed chrome resolves into a compact fixed top row labeled `Posts`, and the selected post scrolls underneath it so the post header starts directly below the bar.
 
 Feed close flow:
 
@@ -170,6 +171,7 @@ Current open behavior:
 - record the tapped grid cell frame in window coordinates
 - animate the live overlay from the grid cell frame to the full-screen frame
 - keep the media visible during motion while feed chrome fades in afterward
+- settle into a fixed top `Posts` row with the feed scroll view living underneath it
 - finish cleanup in a non-animated transaction so there is no end-of-animation handoff flash
 
 Important implementation detail:
@@ -225,7 +227,7 @@ If media support grows, extend these helpers before duplicating custom image/vid
 
 ### Feed state
 - `InstagramPostFeedScreen`
-  visible post detection, feed scrolling, visible media frame reporting, presentation-driven repositioning, and chrome visibility
+  fixed top-row layout, visible post detection, feed scrolling, visible media frame reporting, presentation-driven repositioning, and chrome visibility
 - `FeedMediaPager`
   selected media page per post
 - `FeedVideoPlaybackController`

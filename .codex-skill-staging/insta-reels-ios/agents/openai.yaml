@@ -1,0 +1,4 @@
+interface:
+  display_name: "Insta Reels iOS"
+  short_description: "Guidance for the insta-reels SwiftUI app"
+  default_prompt: "Use $insta-reels-ios to work on the insta-reels SwiftUI project."

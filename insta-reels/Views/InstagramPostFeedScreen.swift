@@ -28,103 +28,110 @@ struct InstagramPostFeedScreen: View {
     var backgroundOpacity: Double = 1
     var isInteractionEnabled = true
     var isPresented = false
-    var presentationSequence = 0
+
+    @State private var latestPostOffsets: [String: CGFloat] = [:]
+    @State private var latestViewportHeight = UIScreen.main.bounds.height
 
     private let backgroundColor = Color.black
     private let secondaryTextColor = Color(red: 168.0 / 255.0, green: 173.0 / 255.0, blue: 184.0 / 255.0)
-    private let dividerColor = Color.white.opacity(0.08)
+    private let topBarContentHeight: CGFloat = 44
+
     var body: some View {
         GeometryReader { geometry in
-            ZStack(alignment: .top) {
+            let topBarInset = windowSafeAreaTopInset() + topBarContentHeight
+
+            ZStack {
                 backgroundColor
                     .opacity(backgroundOpacity)
                     .ignoresSafeArea()
 
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: 26) {
-                            ForEach(posts) { post in
-                                InstagramPostFeedCard(
-                                    post: post,
-                                    isCurrentVisible: visiblePostID == post.id,
-                                    chromeOpacity: chromeOpacity,
-                                    visibleTransitionContent: $visibleTransitionContent,
-                                    visibleTransitionFrame: $visibleTransitionFrame
-                                )
-                                    .id(post.id)
-                                    .background {
-                                        GeometryReader { geometry in
-                                            Color.clear.preference(
-                                                key: FeedPostOffsetPreferenceKey.self,
-                                                value: [post.id: geometry.frame(in: .named("feedScroll")).minY]
-                                            )
+                VStack(spacing: 0) {
+                    topBar
+                        .opacity(chromeOpacity)
+                        .allowsHitTesting(isPresented && isInteractionEnabled)
+
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(spacing: 26) {
+                                ForEach(posts) { post in
+                                    InstagramPostFeedCard(
+                                        post: post,
+                                        isCurrentVisible: visiblePostID == post.id,
+                                        chromeOpacity: chromeOpacity,
+                                        visibleTransitionContent: $visibleTransitionContent,
+                                        visibleTransitionFrame: $visibleTransitionFrame
+                                    )
+                                        .id(post.id)
+                                        .background {
+                                            GeometryReader { geometry in
+                                                Color.clear.preference(
+                                                    key: FeedPostOffsetPreferenceKey.self,
+                                                    value: [post.id: geometry.frame(in: .named("feedScroll")).minY]
+                                                )
+                                            }
                                         }
-                                    }
+                                }
+                            }
+                            .padding(.bottom, 32)
+                        }
+                        .coordinateSpace(name: "feedScroll")
+                        .scrollIndicators(.hidden)
+                        .opacity(contentOpacity)
+                        .allowsHitTesting(isPresented && isInteractionEnabled)
+                        .onAppear {
+                            latestViewportHeight = max(geometry.size.height - topBarInset, 1)
+                        }
+                        .onChange(of: geometry.size.height) { _, newValue in
+                            latestViewportHeight = max(newValue - topBarInset, 1)
+                        }
+                        .onAppear {
+                            guard isPresented else {
+                                return
+                            }
+
+                            scrollToInitialPost(using: proxy)
+                        }
+                        .onChange(of: isPresented) { _, newValue in
+                            guard newValue else {
+                                visibleTransitionFrame = nil
+                                return
+                            }
+
+                            scrollToInitialPost(using: proxy)
+                        }
+                        .onPreferenceChange(FeedPostOffsetPreferenceKey.self) { offsets in
+                            latestPostOffsets = offsets
+
+                            guard isPresented else {
+                                return
+                            }
+
+                            guard let closestPostID = currentVisiblePostID(
+                                from: offsets,
+                                viewportHeight: max(geometry.size.height - topBarInset, 1),
+                                topInset: 0
+                            ) else {
+                                return
+                            }
+
+                            if visiblePostID != closestPostID {
+                                visiblePostID = closestPostID
                             }
                         }
-                        .padding(.bottom, 32)
-                    }
-                    .safeAreaInset(edge: .top, spacing: 0) {
-                        topBar
-                            .opacity(chromeOpacity)
-                    }
-                    .coordinateSpace(name: "feedScroll")
-                    .scrollIndicators(.hidden)
-                    .opacity(contentOpacity)
-                    .allowsHitTesting(isPresented && isInteractionEnabled)
-                    .onAppear {
-                        guard isPresented else {
-                            return
-                        }
+                        .onPreferenceChange(FeedVisibleMediaFramePreferenceKey.self) { frames in
+                            guard isPresented else {
+                                return
+                            }
 
-                        scrollToInitialPost(using: proxy)
-                    }
-                    .onChange(of: presentationSequence) { _, _ in
-                        guard isPresented else {
-                            return
-                        }
-
-                        scrollToInitialPost(using: proxy)
-                    }
-                    .onChange(of: isPresented) { _, newValue in
-                        guard newValue else {
-                            visibleTransitionFrame = nil
-                            return
-                        }
-
-                        scrollToInitialPost(using: proxy)
-                    }
-                    .onPreferenceChange(FeedPostOffsetPreferenceKey.self) { offsets in
-                        guard isPresented else {
-                            return
-                        }
-
-                        guard let closestPostID = currentVisiblePostID(
-                            from: offsets,
-                            viewportHeight: geometry.size.height,
-                            topInset: feedTopInset
-                        ) else {
-                            return
-                        }
-
-                        if visiblePostID != closestPostID {
-                            visiblePostID = closestPostID
-                        }
-                    }
-                    .onPreferenceChange(FeedVisibleMediaFramePreferenceKey.self) { frames in
-                        guard isPresented else {
-                            return
-                        }
-
-                        if let visiblePostID, let frame = frames[visiblePostID] {
-                            visibleTransitionFrame = frame
-                        } else {
-                            visibleTransitionFrame = frames.values.first
+                            if let visiblePostID, let frame = frames[visiblePostID] {
+                                visibleTransitionFrame = frame
+                            } else {
+                                visibleTransitionFrame = frames.values.first
+                            }
                         }
                     }
                 }
             }
-            .simultaneousGesture(edgeBackSwipeGesture)
         }
     }
 
@@ -146,56 +153,57 @@ struct InstagramPostFeedScreen: View {
         }
     }
 
+    private func requestClose() {
+        if let closestPostID = currentVisiblePostID(
+            from: latestPostOffsets,
+            viewportHeight: latestViewportHeight,
+            topInset: 0
+        ) {
+            visiblePostID = closestPostID
+        }
+
+        DispatchQueue.main.async {
+            onClose()
+        }
+    }
+
     private var topBar: some View {
-        VStack(spacing: 0) {
-            HStack(alignment: .top, spacing: 14) {
+        ZStack {
+            Text("Posts")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.white)
+
+            HStack(spacing: 0) {
                 Button {
-                    onClose()
+                    requestClose()
                 } label: {
                     Image(systemName: "chevron.left")
-                        .font(.system(size: 22, weight: .semibold))
+                        .font(.system(size: 20, weight: .semibold))
                         .foregroundStyle(.white)
+                        .frame(width: 44, height: 44)
                 }
                 .buttonStyle(.plain)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.system(size: 19, weight: .bold))
-                        .foregroundStyle(.white)
-
-//                    Text("\(posts.count.formatted()) posts")
-//                        .font(.system(size: 13, weight: .medium))
-//                        .foregroundStyle(secondaryTextColor)
-                }
+                .contentShape(Rectangle())
 
                 Spacer()
             }
-            .padding(.horizontal, 22)
-            .padding(.top, 14)
-            .padding(.bottom, 12)
-
-            Rectangle()
-                .fill(dividerColor)
-                .frame(height: 1)
         }
+        .frame(height: topBarContentHeight)
+        .padding(.horizontal, 12)
+//        .padding(.top, windowSafeAreaTopInset())
         .background(backgroundColor.opacity(0.97))
     }
 
-    private var feedTopInset: CGFloat { 78 }
+    private func windowSafeAreaTopInset() -> CGFloat {
+        guard let windowScene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }),
+              let window = windowScene.windows.first(where: \.isKeyWindow) ?? windowScene.windows.first
+        else {
+            return 0
+        }
 
-    private var edgeBackSwipeGesture: some Gesture {
-        DragGesture(minimumDistance: 18, coordinateSpace: .local)
-            .onEnded { value in
-                let startedFromEdge = value.startLocation.x < 36
-                let movedMostlyHorizontally = abs(value.translation.width) > abs(value.translation.height)
-                let movedFarEnough = value.translation.width > 84
-
-                guard startedFromEdge, movedMostlyHorizontally, movedFarEnough else {
-                    return
-                }
-
-                onClose()
-            }
+        return window.safeAreaInsets.top
     }
 }
 
@@ -332,20 +340,29 @@ private struct FeedMediaPager: View {
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            TabView(selection: $selectedPage) {
-                ForEach(Array(post.media.enumerated()), id: \.element.id) { index, media in
+            if post.media.count <= 1 {
+                if let media = currentMedia {
                     FeedMediaPage(
                         media: media,
-                        isActive: selectedPage == index
+                        isActive: isCurrentVisible
                     )
-                        .tag(index)
+                } else {
+                    Color.black
                 }
-            }
-            .tabViewStyle(.page(indexDisplayMode: post.media.count > 1 ? .automatic : .never))
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .animation(.easeInOut(duration: 0.18), value: selectedPage)
+            } else {
+                TabView(selection: $selectedPage) {
+                    ForEach(Array(post.media.enumerated()), id: \.element.id) { index, media in
+                        FeedMediaPage(
+                            media: media,
+                            isActive: selectedPage == index
+                        )
+                            .tag(index)
+                    }
+                }
+                .tabViewStyle(.page(indexDisplayMode: .automatic))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .animation(.easeInOut(duration: 0.18), value: selectedPage)
 
-            if post.media.count > 1 {
                 Text("\(selectedPage + 1)/\(post.media.count)")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.white)
@@ -387,8 +404,19 @@ private struct FeedMediaPager: View {
         }
     }
 
+    private var currentMedia: InstagramMedia? {
+        guard post.media.indices.contains(selectedPage) else {
+            return post.media.first
+        }
+
+        return post.media[selectedPage]
+    }
+
     private var currentAspectRatio: CGFloat {
-        let media = post.media[selectedPage]
+        guard let media = currentMedia else {
+            return 1
+        }
+
         let ratio = CGFloat(media.width) / CGFloat(max(media.height, 1))
         return min(max(ratio, 0.5625), 1.0)
     }
