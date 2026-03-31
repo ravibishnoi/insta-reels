@@ -9,7 +9,7 @@ Use it to:
 - update future contributors on transition, media, and data-flow decisions
 
 Update this file whenever any of these change:
-- a new screen or major view model is added
+- a new screen or major controller is added
 - data starts coming from a new source
 - transition behavior changes
 - shared media/loading infrastructure changes
@@ -17,21 +17,21 @@ Update this file whenever any of these change:
 
 ## Overview
 
-`insta-reels` is a SwiftUI app that renders an Instagram-style profile screen and an immersive post feed using bundled mock data.
+`insta-reels` is a UIKit app with fully programmatic layout. It renders an Instagram-style profile screen and an immersive post feed using bundled mock data.
 
 High-level flow:
 
 ```mermaid
 flowchart TD
-    A["insta_reelsApp"] --> B["ContentView"]
-    B --> C["InstagramProfileViewModel"]
-    C --> D["InstagramProfileRepository"]
-    D --> E["MockInstagramPosts.json"]
-    C --> F["InstagramProfileScreen"]
-    F --> G["InstagramPostFeedScreen"]
-    F --> H["Transition System"]
-    G --> I["Media + Playback"]
-    I --> J["CachedAsyncImage"]
+    A["AppDelegate"] --> B["SceneDelegate"]
+    B --> C["RootViewController"]
+    C --> D["InstagramProfileViewModel"]
+    D --> E["InstagramProfileRepository"]
+    E --> F["MockInstagramPosts.json"]
+    C --> G["InstagramProfileScreen"]
+    G --> H["InstagramPostFeedScreen"]
+    H --> I["Media + Playback"]
+    I --> J["RemoteImageView + RemoteImageCache"]
     I --> K["InstagramMediaPlaybackResolver"]
 ```
 
@@ -39,19 +39,25 @@ flowchart TD
 
 ### App shell
 - `insta-reels/insta_reelsApp.swift`
-  Starts the app and mounts `ContentView`.
-- `insta-reels/ContentView.swift`
-  Owns the root `InstagramProfileViewModel` and launch overlay animation.
+  Defines the UIKit `AppDelegate`.
+- `insta-reels/SceneDelegate.swift`
+  Creates the main window and installs the root controller.
+- `insta-reels/RootViewController.swift`
+  Owns the root `InstagramProfileViewModel`, hosts `InstagramProfileScreen`, and manages the post-launch overlay animation.
 
 ### Presentation layer
 - `insta-reels/Views/InstagramProfileScreen.swift`
-  Main profile UI, profile grid, single-hierarchy feed overlay coordination, live open transition, snapshot-based close transition, and return-to-grid behavior.
+  UIKit profile screen controller, profile grid, feed overlay coordination, live open transition, snapshot-based close transition, and return-to-grid behavior.
 - `insta-reels/Views/InstagramPostFeedScreen.swift`
-  Always-mounted post overlay content, compact fixed `Posts` top bar, feed scrolling below that bar, visible post tracking, visible media tracking, gesture-based close, inline media paging, and chrome fading around the live media transition.
+  UIKit feed controller, fixed `Posts` top bar, feed scrolling, visible-post tracking, visible-media tracking, media paging, and inline video playback.
 
 ### Shared UI/media helpers
 - `insta-reels/Views/CachedAsyncImage.swift`
-  Shared image loading and disk/memory caching wrapper used by profile and feed surfaces.
+  Shared `RemoteImageView` and cache infrastructure used by profile and feed surfaces.
+- `insta-reels/Views/AppTheme.swift`
+  Shared UIKit color constants.
+- `insta-reels/Views/UIKitHelpers.swift`
+  Small UIKit layout helpers used across programmatic views.
 - `insta-reels/Data/InstagramMediaPlaybackResolver.swift`
   Resolves playable video URLs and provides mock fallbacks for unsupported media hosts.
 
@@ -71,10 +77,11 @@ flowchart TD
 
 ### 1. App and startup
 
-`insta_reelsApp` should stay thin.
+`AppDelegate` and `SceneDelegate` should stay thin.
 
-`ContentView` is responsible for:
+`RootViewController` is responsible for:
 - creating the root view model
+- attaching the main profile controller
 - holding launch-overlay state
 - deciding when the UI is ready to transition from launch to app content
 
@@ -91,7 +98,7 @@ It is responsible for:
 
 It should not:
 - own animation state
-- know about geometry, transitions, or SwiftUI view coordination
+- know about view geometry or controller coordination
 - fetch media directly
 
 ### 3. Data layer
@@ -106,9 +113,9 @@ It is responsible for:
 
 If the project later moves to a network backend, this is the layer that should change first. The view model should continue talking to a repository protocol, not to networking code directly.
 
-### 4. Screen/view layer
+### 4. Screen/controller layer
 
-`InstagramProfileScreen` is the most stateful view in the app today.
+`InstagramProfileScreen` is the most stateful controller in the app today.
 
 It owns:
 - profile screen composition
@@ -123,7 +130,6 @@ It owns:
 `InstagramPostFeedScreen` owns:
 - feed layout and scrolling
 - compact fixed `Posts` top bar and back button
-- keeping the active post header directly below the top bar
 - visible post detection
 - visible media frame reporting
 - media pager state per feed card
@@ -134,66 +140,60 @@ It owns:
 
 Normal profile load:
 
-1. `ContentView` creates `InstagramProfileViewModel`.
-2. `InstagramProfileScreen` calls `loadIfNeeded()`.
-3. `InstagramProfileViewModel` requests a payload from `InstagramProfileRepository`.
-4. The repository decodes bundled JSON via `MockInstagramDataset`.
-5. The view model transforms the payload into `InstagramProfileScreenModel`.
-6. `InstagramProfileScreen` renders the model.
+1. `SceneDelegate` creates `RootViewController`.
+2. `RootViewController` creates `InstagramProfileViewModel`.
+3. `RootViewController` mounts `InstagramProfileScreen`.
+4. `InstagramProfileScreen` calls `loadIfNeeded()`.
+5. `InstagramProfileViewModel` requests a payload from `InstagramProfileRepository`.
+6. The repository decodes bundled JSON via `MockInstagramDataset`.
+7. The view model transforms the payload into `InstagramProfileScreenModel`.
+8. `InstagramProfileScreen` renders the model.
 
 Feed open flow:
 
 1. User taps a grid item.
-2. `InstagramProfileScreen` records the tapped grid cell frame and sets feed presentation state.
-3. `InstagramPostFeedScreen` is already in the same root `ZStack`, so there is no navigation or screen push.
-4. The live feed overlay itself animates from the tapped cell frame to the full-screen frame.
-5. Feed chrome resolves into a compact fixed top row labeled `Posts`, and the selected post scrolls underneath it so the post header starts directly below the bar.
+2. `InstagramProfileScreen` resolves the tapped grid cell frame.
+3. `InstagramPostFeedScreen` is attached as an overlay child controller in the same hierarchy.
+4. The live feed surface animates from the tapped cell frame to the full-screen frame.
+5. Feed chrome fades in after the live media surface settles.
 
 Feed close flow:
 
 1. `InstagramProfileScreen` freezes feed-driven transition updates.
-2. The target grid cell frame is resolved.
+2. The target grid cell frame is resolved, scrolling the profile if needed.
 3. Close captures the currently visible feed media into a bitmap snapshot.
 4. The live feed overlay is hidden and the snapshot animates back to the grid cell.
 5. State is reset only after the snapshot animation finishes.
 
 ## Transition Architecture
 
-This project uses a hybrid transition strategy on purpose.
+This project keeps the same hybrid transition strategy as the SwiftUI version, but now in UIKit.
 
 ### Opening transition
 
-Opening uses a live single-hierarchy overlay motion.
+Opening uses a live overlay motion.
 
 Current open behavior:
 - never navigate away from the profile screen
-- keep `InstagramPostFeedScreen` in the same root `ZStack` as the profile feed
+- keep the feed in the same controller hierarchy as the profile screen
 - record the tapped grid cell frame in window coordinates
 - animate the live overlay from the grid cell frame to the full-screen frame
 - keep the media visible during motion while feed chrome fades in afterward
-- settle into a fixed top `Posts` row with the feed scroll view living underneath it
-- finish cleanup in a non-animated transaction so there is no end-of-animation handoff flash
 
 Important implementation detail:
 - `InstagramProfileScreen` owns the overlay frame and presentation sequencing
-- `InstagramPostFeedScreen` stays mounted and responds to `isPresented` / `presentationSequence` instead of mount-time navigation events
+- `InstagramPostFeedScreen` reports the visible post, visible media, and media frame back to the profile screen
 
 ### Closing transition
 
 Closing still prefers a snapshot overlay path because it is more stable than relying on two live views during teardown.
-
-Reasons:
-- the feed can mutate visible media while dismissing
-- the destination grid cell can re-enter the hierarchy at the wrong moment
-- live source/destination swaps are more prone to flicker at the last frame
-- a single bitmap avoids the reveal race between the live overlay and the destination grid cell
 
 Current close behavior:
 - freeze feed-driven transition updates during dismiss
 - capture the current visible feed media into a snapshot
 - animate the snapshot to the grid target frame
 - hide the live feed overlay while the snapshot is animating
-- remove the snapshot and restore the real grid in one non-animated transaction
+- restore the real grid only after the animation completes
 
 If future work touches dismiss behavior, preserve these invariants:
 - never let the target post/media change mid-dismiss
@@ -203,9 +203,9 @@ If future work touches dismiss behavior, preserve these invariants:
 
 ## Media Architecture
 
-`CachedAsyncImage` is the shared image surface for the app.
+`RemoteImageView` and `RemoteImageCache` are the shared image surfaces for the app.
 
-It provides:
+They provide:
 - async loading
 - in-memory caching
 - disk caching
@@ -218,17 +218,17 @@ If media support grows, extend these helpers before duplicating custom image/vid
 ## Key State Ownership
 
 ### Root state
-- `ContentView`
+- `RootViewController`
   launch overlay and root view-model lifetime
 
 ### Screen state
 - `InstagramProfileScreen`
-  transition sequencing, overlay frame state, grid hiding/reveal state, dismiss snapshot state, and grid return animation state
+  transition sequencing, overlay transform state, grid hiding, dismiss snapshot state, and grid return animation state
 
 ### Feed state
 - `InstagramPostFeedScreen`
-  fixed top-row layout, visible post detection, feed scrolling, visible media frame reporting, presentation-driven repositioning, and chrome visibility
-- `FeedMediaPager`
+  fixed top-row layout, visible post detection, feed scrolling, visible media frame reporting, and chrome visibility
+- `FeedMediaPagerView`
   selected media page per post
 - `FeedVideoPlaybackController`
   inline video readiness, mute state, and playback loop behavior
@@ -250,8 +250,8 @@ If media support grows, extend these helpers before duplicating custom image/vid
 
 ### Avoid
 
-- putting repository logic inside SwiftUI views
-- putting geometry/animation state inside the view model
+- putting repository logic inside UIKit controllers
+- putting geometry or animation state inside the view model
 - duplicating image loading logic in multiple view files
 - mixing mock-data decoding with view composition code
 
@@ -259,7 +259,7 @@ If media support grows, extend these helpers before duplicating custom image/vid
 
 These are not required now, but they are the cleanest pressure-release points if the app grows:
 
-1. Extract transition state from `InstagramProfileScreen` into a dedicated transition coordinator or view model.
+1. Extract transition state from `InstagramProfileScreen` into a dedicated coordinator.
 2. Split reusable profile subviews into separate files once the profile screen becomes harder to scan.
 3. Move feed card, media pager, and video playback pieces into dedicated files if feed complexity increases.
 4. Add a `docs/` folder if architecture, animation, and product docs grow beyond a single file.
@@ -268,11 +268,11 @@ These are not required now, but they are the cleanest pressure-release points if
 
 When you change the project structure, update this file by checking:
 
-- Is there a new top-level screen?
+- Is there a new top-level screen or controller?
 - Did any file take on a new responsibility?
 - Did data start coming from a new source?
 - Did the transition system change?
 - Did media loading or playback behavior move?
 - Does the project map still match the repo?
 
-If the answer is yes to any of these, update `ARCHITECTURE.md` in the same PR or change set.
+If the answer is yes to any of these, update `ARCHITECTURE.md` in the same change set.

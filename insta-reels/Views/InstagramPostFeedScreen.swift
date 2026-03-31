@@ -6,8 +6,6 @@
 //
 
 import AVFoundation
-import Combine
-import SwiftUI
 import UIKit
 
 struct InstagramFeedTransitionContent: Equatable {
@@ -15,548 +13,914 @@ struct InstagramFeedTransitionContent: Equatable {
     let media: InstagramMedia
 }
 
-struct InstagramPostFeedScreen: View {
-    let title: String
+protocol InstagramPostFeedScreenDelegate: AnyObject {
+    func feedScreenDidRequestClose(_ screen: InstagramPostFeedScreen)
+    func feedScreen(
+        _ screen: InstagramPostFeedScreen,
+        didUpdateVisiblePostID postID: String?,
+        transitionContent: InstagramFeedTransitionContent?,
+        transitionFrame: CGRect?
+    )
+}
+
+final class InstagramPostFeedScreen: UIViewController {
+    weak var delegate: InstagramPostFeedScreenDelegate?
+
     let posts: [InstagramPost]
     let initialPostID: String
-    @Binding var visiblePostID: String?
-    @Binding var visibleTransitionContent: InstagramFeedTransitionContent?
-    @Binding var visibleTransitionFrame: CGRect?
-    let onClose: () -> Void
-    var contentOpacity: Double = 1
-    var chromeOpacity: Double = 1
-    var backgroundOpacity: Double = 1
-    var isInteractionEnabled = true
-    var isPresented = false
 
-    @State private var latestPostOffsets: [String: CGFloat] = [:]
-    @State private var latestViewportHeight = UIScreen.main.bounds.height
+    private let topBar = FeedTopBarView()
+    private let collectionView: UICollectionView
 
-    private let backgroundColor = Color.black
-    private let secondaryTextColor = Color(red: 168.0 / 255.0, green: 173.0 / 255.0, blue: 184.0 / 255.0)
-    private let topBarContentHeight: CGFloat = 44
+    private var hasScrolledToInitialPost = false
+    private var chromeAlpha: CGFloat = 1
 
-    var body: some View {
-        GeometryReader { geometry in
-            let topBarInset = windowSafeAreaTopInset() + topBarContentHeight
+    private(set) var visiblePostID: String?
+    private(set) var visibleTransitionContent: InstagramFeedTransitionContent?
+    private(set) var visibleTransitionFrame: CGRect?
 
-            ZStack {
-                backgroundColor
-                    .opacity(backgroundOpacity)
-                    .ignoresSafeArea()
+    var lockTransitionUpdates = false
 
-                VStack(spacing: 0) {
-                    topBar
-                        .opacity(chromeOpacity)
-                        .allowsHitTesting(isPresented && isInteractionEnabled)
+    init(title: String, posts: [InstagramPost], initialPostID: String) {
+        self.posts = posts
+        self.initialPostID = initialPostID
 
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(spacing: 26) {
-                                ForEach(posts) { post in
-                                    InstagramPostFeedCard(
-                                        post: post,
-                                        isCurrentVisible: visiblePostID == post.id,
-                                        chromeOpacity: chromeOpacity,
-                                        visibleTransitionContent: $visibleTransitionContent,
-                                        visibleTransitionFrame: $visibleTransitionFrame
-                                    )
-                                        .id(post.id)
-                                        .background {
-                                            GeometryReader { geometry in
-                                                Color.clear.preference(
-                                                    key: FeedPostOffsetPreferenceKey.self,
-                                                    value: [post.id: geometry.frame(in: .named("feedScroll")).minY]
-                                                )
-                                            }
-                                        }
-                                }
-                            }
-                            .padding(.bottom, 32)
-                        }
-                        .coordinateSpace(name: "feedScroll")
-                        .scrollIndicators(.hidden)
-                        .opacity(contentOpacity)
-                        .allowsHitTesting(isPresented && isInteractionEnabled)
-                        .onAppear {
-                            latestViewportHeight = max(geometry.size.height - topBarInset, 1)
-                        }
-                        .onChange(of: geometry.size.height) { _, newValue in
-                            latestViewportHeight = max(newValue - topBarInset, 1)
-                        }
-                        .onAppear {
-                            guard isPresented else {
-                                return
-                            }
+        let layout = UICollectionViewFlowLayout()
+        layout.scrollDirection = .vertical
+        layout.minimumLineSpacing = 26
+        layout.minimumInteritemSpacing = 0
 
-                            scrollToInitialPost(using: proxy)
-                        }
-                        .onChange(of: isPresented) { _, newValue in
-                            guard newValue else {
-                                visibleTransitionFrame = nil
-                                return
-                            }
+        self.collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
+        super.init(nibName: nil, bundle: nil)
+        self.title = title
+    }
 
-                            scrollToInitialPost(using: proxy)
-                        }
-                        .onPreferenceChange(FeedPostOffsetPreferenceKey.self) { offsets in
-                            latestPostOffsets = offsets
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
-                            guard isPresented else {
-                                return
-                            }
+    override func viewDidLoad() {
+        super.viewDidLoad()
 
-                            guard let closestPostID = currentVisiblePostID(
-                                from: offsets,
-                                viewportHeight: max(geometry.size.height - topBarInset, 1),
-                                topInset: 0
-                            ) else {
-                                return
-                            }
+        view.backgroundColor = .black
 
-                            if visiblePostID != closestPostID {
-                                visiblePostID = closestPostID
-                            }
-                        }
-                        .onPreferenceChange(FeedVisibleMediaFramePreferenceKey.self) { frames in
-                            guard isPresented else {
-                                return
-                            }
-
-                            if let visiblePostID, let frame = frames[visiblePostID] {
-                                visibleTransitionFrame = frame
-                            } else {
-                                visibleTransitionFrame = frames.values.first
-                            }
-                        }
-                    }
-                }
+        topBar.translatesAutoresizingMaskIntoConstraints = false
+        topBar.onClose = { [weak self] in
+            guard let self else {
+                return
             }
+
+            delegate?.feedScreenDidRequestClose(self)
         }
+        view.addSubview(topBar)
+
+        collectionView.translatesAutoresizingMaskIntoConstraints = false
+        collectionView.backgroundColor = .clear
+        collectionView.showsVerticalScrollIndicator = false
+        collectionView.alwaysBounceVertical = true
+        collectionView.contentInset = UIEdgeInsets(top: 0, left: 0, bottom: 32, right: 0)
+        collectionView.dataSource = self
+        collectionView.delegate = self
+        collectionView.register(FeedPostCell.self, forCellWithReuseIdentifier: FeedPostCell.reuseIdentifier)
+        view.addSubview(collectionView)
+
+        NSLayoutConstraint.activate([
+            topBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            topBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            topBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            topBar.heightAnchor.constraint(equalToConstant: 44),
+
+            collectionView.topAnchor.constraint(equalTo: topBar.bottomAnchor),
+            collectionView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            collectionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            collectionView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
     }
 
-    private func currentVisiblePostID(from offsets: [String: CGFloat], viewportHeight: CGFloat, topInset: CGFloat) -> String? {
-        let visibleOffsets = offsets.filter { _, minY in
-            minY < viewportHeight && minY > -viewportHeight
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+
+        if let layout = collectionView.collectionViewLayout as? UICollectionViewFlowLayout,
+           layout.itemSize.width != collectionView.bounds.width {
+            layout.itemSize = CGSize(
+                width: collectionView.bounds.width,
+                height: collectionView.bounds.height
+            )
+            layout.invalidateLayout()
         }
 
-        return visibleOffsets.min { lhs, rhs in
-            abs(lhs.value - topInset) < abs(rhs.value - topInset)
-        }?.key
+        scrollToInitialPostIfNeeded()
+        updateVisibleState()
     }
 
-    private func scrollToInitialPost(using proxy: ScrollViewProxy) {
-        visiblePostID = initialPostID
-
-        DispatchQueue.main.async {
-            proxy.scrollTo(initialPostID, anchor: .top)
-        }
+    func prepareForPresentation() {
+        hasScrolledToInitialPost = false
+        collectionView.reloadData()
+        collectionView.layoutIfNeeded()
     }
 
-    private func requestClose() {
-        if let closestPostID = currentVisiblePostID(
-            from: latestPostOffsets,
-            viewportHeight: latestViewportHeight,
-            topInset: 0
-        ) {
-            visiblePostID = closestPostID
-        }
+    func setChromeAlpha(_ alpha: CGFloat) {
+        chromeAlpha = alpha
+        topBar.alpha = alpha
 
-        DispatchQueue.main.async {
-            onClose()
-        }
+        collectionView.visibleCells
+            .compactMap { $0 as? FeedPostCell }
+            .forEach { $0.setChromeAlpha(alpha) }
     }
 
-    private var topBar: some View {
-        ZStack {
-            Text("Posts")
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.white)
-
-            HStack(spacing: 0) {
-                Button {
-                    requestClose()
-                } label: {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .frame(width: 44, height: 44)
-                }
-                .buttonStyle(.plain)
-                .contentShape(Rectangle())
-
-                Spacer()
-            }
-        }
-        .frame(height: topBarContentHeight)
-        .padding(.horizontal, 12)
-//        .padding(.top, windowSafeAreaTopInset())
-        .background(backgroundColor.opacity(0.97))
+    func setInteractionEnabled(_ enabled: Bool) {
+        topBar.isUserInteractionEnabled = enabled
+        collectionView.isUserInteractionEnabled = enabled
     }
 
-    private func windowSafeAreaTopInset() -> CGFloat {
-        guard let windowScene = UIApplication.shared.connectedScenes
-            .compactMap({ $0 as? UIWindowScene })
-            .first(where: { $0.activationState == .foregroundActive }),
-              let window = windowScene.windows.first(where: \.isKeyWindow) ?? windowScene.windows.first
+    private func scrollToInitialPostIfNeeded() {
+        guard hasScrolledToInitialPost == false,
+              collectionView.bounds.height > 0
         else {
-            return 0
-        }
-
-        return window.safeAreaInsets.top
-    }
-}
-
-private struct InstagramPostFeedCard: View {
-    let post: InstagramPost
-    let isCurrentVisible: Bool
-    let chromeOpacity: Double
-    @Binding var visibleTransitionContent: InstagramFeedTransitionContent?
-    @Binding var visibleTransitionFrame: CGRect?
-
-    private let secondaryTextColor = Color(red: 168.0 / 255.0, green: 173.0 / 255.0, blue: 184.0 / 255.0)
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            header
-                .opacity(chromeOpacity)
-            mediaPager
-            actionRow
-                .opacity(chromeOpacity)
-            metaSection
-                .opacity(chromeOpacity)
-        }
-    }
-
-    private var header: some View {
-        HStack(spacing: 10) {
-            FeedCircularAsyncImage(url: post.author.avatarURL)
-                .frame(width: 34, height: 34)
-
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 4) {
-                    Text(post.author.username)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.white)
-
-                    if post.author.isVerified {
-                        Image(systemName: "checkmark.seal.fill")
-                            .font(.system(size: 12))
-                            .foregroundStyle(Color(red: 0.0, green: 149.0 / 255.0, blue: 246.0 / 255.0))
-                    }
-                }
-
-                if let locationName = post.locationName {
-                    Text(locationName)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(secondaryTextColor)
-                }
-            }
-
-            Spacer()
-
-            Image(systemName: "ellipsis")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(.white)
-        }
-        .padding(.horizontal, 14)
-    }
-
-    @ViewBuilder
-    private var mediaPager: some View {
-        FeedMediaPager(
-            post: post,
-            isCurrentVisible: isCurrentVisible,
-            visibleTransitionContent: $visibleTransitionContent,
-            visibleTransitionFrame: $visibleTransitionFrame
-        )
-    }
-
-    private var actionRow: some View {
-        HStack {
-            HStack(spacing: 16) {
-                Image(systemName: post.isLikedByCurrentUser ? "heart.fill" : "heart")
-                    .foregroundStyle(post.isLikedByCurrentUser ? .red : .white)
-                Image(systemName: "bubble.right")
-                Image(systemName: "paperplane")
-            }
-            .font(.system(size: 22, weight: .regular))
-
-            Spacer()
-
-            Image(systemName: post.isSavedByCurrentUser ? "bookmark.fill" : "bookmark")
-                .font(.system(size: 21, weight: .regular))
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 14)
-    }
-
-    private var metaSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("\(post.metrics.likeCount.formatted()) likes")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(.white)
-
-            Text("\(Text(post.author.username).fontWeight(.semibold)) \(Text(post.caption))")
-            .font(.system(size: 14))
-            .foregroundStyle(.white)
-            .lineLimit(3)
-
-            if post.metrics.commentCount > 0 {
-                Text("View all \(post.metrics.commentCount.formatted()) comments")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(secondaryTextColor)
-            }
-
-            if post.isSponsored, let sponsorName = post.sponsorName {
-                Text("Sponsored • \(sponsorName)")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(secondaryTextColor)
-            }
-
-            Text(timestampText(for: post.createdAt))
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(secondaryTextColor)
-                .textCase(.uppercase)
-        }
-        .padding(.horizontal, 14)
-    }
-
-    private func timestampText(for date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMM d, yyyy"
-        return formatter.string(from: date)
-    }
-}
-
-private struct FeedMediaPager: View {
-    let post: InstagramPost
-    let isCurrentVisible: Bool
-    @Binding var visibleTransitionContent: InstagramFeedTransitionContent?
-    @Binding var visibleTransitionFrame: CGRect?
-
-    @State private var selectedPage = 0
-    @State private var containerWidth = UIScreen.main.bounds.width
-
-    var body: some View {
-        ZStack(alignment: .topTrailing) {
-            if post.media.count <= 1 {
-                if let media = currentMedia {
-                    FeedMediaPage(
-                        media: media,
-                        isActive: isCurrentVisible
-                    )
-                } else {
-                    Color.black
-                }
-            } else {
-                TabView(selection: $selectedPage) {
-                    ForEach(Array(post.media.enumerated()), id: \.element.id) { index, media in
-                        FeedMediaPage(
-                            media: media,
-                            isActive: selectedPage == index
-                        )
-                            .tag(index)
-                    }
-                }
-                .tabViewStyle(.page(indexDisplayMode: .automatic))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .animation(.easeInOut(duration: 0.18), value: selectedPage)
-
-                Text("\(selectedPage + 1)/\(post.media.count)")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(Color.black.opacity(0.55))
-                    .clipShape(Capsule())
-                    .padding(12)
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .frame(height: mediaHeight)
-        .background {
-            GeometryReader { geometry in
-                Color.clear
-                    .onAppear {
-                        updateContainerWidth(geometry.size.width)
-                    }
-                    .onChange(of: geometry.size.width) { _, newValue in
-                        updateContainerWidth(newValue)
-                    }
-                    .preference(
-                        key: FeedVisibleMediaFramePreferenceKey.self,
-                        value: isCurrentVisible
-                        ? [post.id: geometry.frame(in: .global)]
-                        : [:]
-                    )
-            }
-        }
-        .clipped()
-        .onAppear {
-            syncVisibleTransitionContent()
-        }
-        .onChange(of: selectedPage) { _, _ in
-            syncVisibleTransitionContent()
-        }
-        .onChange(of: isCurrentVisible) { _, _ in
-            syncVisibleTransitionContent()
-        }
-    }
-
-    private var currentMedia: InstagramMedia? {
-        guard post.media.indices.contains(selectedPage) else {
-            return post.media.first
-        }
-
-        return post.media[selectedPage]
-    }
-
-    private var currentAspectRatio: CGFloat {
-        guard let media = currentMedia else {
-            return 1
-        }
-
-        let ratio = CGFloat(media.width) / CGFloat(max(media.height, 1))
-        return min(max(ratio, 0.5625), 1.0)
-    }
-
-    private var mediaHeight: CGFloat {
-        containerWidth / currentAspectRatio
-    }
-
-    private func updateContainerWidth(_ width: CGFloat) {
-        guard width.isFinite, width > 0 else {
             return
         }
 
-        if abs(containerWidth - width) > 0.5 {
-            containerWidth = width
-        }
+        let targetIndex = posts.firstIndex(where: { $0.id == initialPostID }) ?? 0
+        let indexPath = IndexPath(item: targetIndex, section: 0)
+
+        collectionView.scrollToItem(at: indexPath, at: .top, animated: false)
+        hasScrolledToInitialPost = true
     }
 
-    private func syncVisibleTransitionContent() {
-        guard isCurrentVisible, post.media.indices.contains(selectedPage) else {
+    private func updateVisibleState() {
+        guard lockTransitionUpdates == false else {
             return
         }
 
-        let content = InstagramFeedTransitionContent(
-            postID: post.id,
-            media: post.media[selectedPage]
-        )
+        let visibleIndexPaths = collectionView.indexPathsForVisibleItems
 
-        if visibleTransitionContent != content {
-            visibleTransitionContent = content
-        }
-    }
-}
-
-private struct FeedMediaPage: View {
-    let media: InstagramMedia
-    let isActive: Bool
-    private let playbackResolver = InstagramMediaPlaybackResolver()
-
-    var body: some View {
-        ZStack {
-            Color.black
-
-            FeedRectangularAsyncImage(url: media.thumbnailURL ?? media.mediaURL)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            if media.type == .video, let playbackURL = playbackResolver.playbackURL(for: media) {
-                FeedInlineVideoPlayer(
-                    url: playbackURL,
-                    isActive: isActive
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if media.type == .video {
-                Image(systemName: "play.circle.fill")
-                    .font(.system(size: 54))
-                    .foregroundStyle(.white.opacity(0.92))
+        let currentIndexPath = visibleIndexPaths.min { lhs, rhs in
+            guard let left = collectionView.layoutAttributesForItem(at: lhs),
+                  let right = collectionView.layoutAttributesForItem(at: rhs)
+            else {
+                return false
             }
+
+            let leftDistance = abs(left.frame.minY - collectionView.contentOffset.y)
+            let rightDistance = abs(right.frame.minY - collectionView.contentOffset.y)
+            return leftDistance < rightDistance
         }
-        .clipped()
-        .accessibilityLabel(media.altText)
-    }
-}
 
-private struct FeedInlineVideoPlayer: View {
-    let url: URL
-    let isActive: Bool
+        for cell in collectionView.visibleCells {
+            guard let feedCell = cell as? FeedPostCell,
+                  let indexPath = collectionView.indexPath(for: feedCell)
+            else {
+                continue
+            }
 
-    @StateObject private var playbackController: FeedVideoPlaybackController
+            let isCurrentVisible = indexPath == currentIndexPath
+            feedCell.setCurrentVisible(isCurrentVisible)
+            feedCell.setChromeAlpha(chromeAlpha)
+        }
 
-    init(url: URL, isActive: Bool) {
-        self.url = url
-        self.isActive = isActive
-        _playbackController = StateObject(
-            wrappedValue: FeedVideoPlaybackController(url: url)
+        guard let currentIndexPath,
+              posts.indices.contains(currentIndexPath.item),
+              let currentCell = collectionView.cellForItem(at: currentIndexPath) as? FeedPostCell
+        else {
+            visiblePostID = nil
+            visibleTransitionContent = nil
+            visibleTransitionFrame = nil
+            delegate?.feedScreen(self, didUpdateVisiblePostID: nil, transitionContent: nil, transitionFrame: nil)
+            return
+        }
+
+        let post = posts[currentIndexPath.item]
+        visiblePostID = post.id
+        visibleTransitionContent = currentCell.currentTransitionContent
+        visibleTransitionFrame = currentCell.currentTransitionFrameInWindow()
+        delegate?.feedScreen(
+            self,
+            didUpdateVisiblePostID: visiblePostID,
+            transitionContent: visibleTransitionContent,
+            transitionFrame: visibleTransitionFrame
         )
     }
+}
 
-    var body: some View {
-        ZStack(alignment: .bottomTrailing) {
-            FeedPlayerLayer(player: playbackController.player)
-                .opacity(playbackController.isReadyToDisplay ? 1 : 0.001)
+extension InstagramPostFeedScreen: UICollectionViewDataSource, UICollectionViewDelegateFlowLayout {
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
+        posts.count
+    }
 
-            if playbackController.isReadyToDisplay == false {
-                ProgressView()
-                    .tint(.white)
-            }
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        guard let cell = collectionView.dequeueReusableCell(
+            withReuseIdentifier: FeedPostCell.reuseIdentifier,
+            for: indexPath
+        ) as? FeedPostCell else {
+            return UICollectionViewCell()
+        }
 
-            Button {
-                playbackController.toggleMuted()
-            } label: {
-                Image(systemName: playbackController.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .frame(width: 34, height: 34)
-                    .background(Color.black.opacity(0.55))
-                    .clipShape(Circle())
-            }
-            .padding(12)
+        let post = posts[indexPath.item]
+        cell.delegate = self
+        cell.configure(post: post, chromeAlpha: chromeAlpha)
+        return cell
+    }
+
+    func collectionView(
+        _ collectionView: UICollectionView,
+        layout collectionViewLayout: UICollectionViewLayout,
+        sizeForItemAt indexPath: IndexPath
+    ) -> CGSize {
+        let width = collectionView.bounds.width
+        let post = posts[indexPath.item]
+        return CGSize(width: width, height: FeedPostCell.height(for: post, width: width))
+    }
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        updateVisibleState()
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        updateVisibleState()
+    }
+
+    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        if decelerate == false {
+            updateVisibleState()
         }
-        .onAppear {
-            playbackController.setActive(isActive)
-        }
-        .onDisappear {
-            playbackController.setActive(false)
-        }
-        .onChange(of: isActive) { _, newValue in
-            playbackController.setActive(newValue)
-        }
+    }
+
+    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+        updateVisibleState()
     }
 }
 
-@MainActor
-private final class FeedVideoPlaybackController: ObservableObject {
+extension InstagramPostFeedScreen: FeedPostCellDelegate {
+    func feedPostCellDidUpdateVisibleMedia(_ cell: FeedPostCell) {
+        guard lockTransitionUpdates == false,
+              let indexPath = collectionView.indexPath(for: cell),
+              posts.indices.contains(indexPath.item),
+              visiblePostID == posts[indexPath.item].id
+        else {
+            return
+        }
+
+        visibleTransitionContent = cell.currentTransitionContent
+        visibleTransitionFrame = cell.currentTransitionFrameInWindow()
+        delegate?.feedScreen(
+            self,
+            didUpdateVisiblePostID: visiblePostID,
+            transitionContent: visibleTransitionContent,
+            transitionFrame: visibleTransitionFrame
+        )
+    }
+}
+
+private final class FeedTopBarView: UIView {
+    var onClose: (() -> Void)?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+
+        backgroundColor = UIColor.black.withAlphaComponent(0.97)
+
+        let titleLabel = UILabel()
+        titleLabel.text = "Posts"
+        titleLabel.textColor = .white
+        titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+
+        let backButton = UIButton(type: .system)
+        backButton.translatesAutoresizingMaskIntoConstraints = false
+        backButton.tintColor = .white
+        backButton.setImage(UIImage(systemName: "chevron.left"), for: .normal)
+        backButton.addAction(UIAction { [weak self] _ in
+            self?.onClose?()
+        }, for: .touchUpInside)
+
+        let titleContainer = UIView()
+        titleContainer.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(titleContainer)
+
+        backButton.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleContainer.addSubview(backButton)
+        titleContainer.addSubview(titleLabel)
+
+        NSLayoutConstraint.activate([
+            titleContainer.topAnchor.constraint(equalTo: topAnchor),
+            titleContainer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            titleContainer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            titleContainer.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            backButton.leadingAnchor.constraint(equalTo: titleContainer.leadingAnchor),
+            backButton.centerYAnchor.constraint(equalTo: titleContainer.centerYAnchor),
+            backButton.widthAnchor.constraint(equalToConstant: 44),
+            backButton.heightAnchor.constraint(equalToConstant: 44),
+
+            titleLabel.centerXAnchor.constraint(equalTo: titleContainer.centerXAnchor),
+            titleLabel.centerYAnchor.constraint(equalTo: titleContainer.centerYAnchor)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
+protocol FeedPostCellDelegate: AnyObject {
+    func feedPostCellDidUpdateVisibleMedia(_ cell: FeedPostCell)
+}
+
+final class FeedPostCell: UICollectionViewCell {
+    static let reuseIdentifier = "FeedPostCell"
+
+    weak var delegate: FeedPostCellDelegate?
+
+    private let headerView = FeedPostHeaderView()
+    private let mediaPagerView = FeedMediaPagerView()
+    private let actionRowView = FeedActionRowView()
+    private let metaView = FeedMetaView()
+    private let contentStack = UIStackView()
+    private var mediaHeightConstraint: NSLayoutConstraint?
+
+    private(set) var post: InstagramPost?
+    private(set) var currentTransitionContent: InstagramFeedTransitionContent?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+
+        contentView.backgroundColor = .black
+
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        contentStack.axis = .vertical
+        contentStack.alignment = .fill
+        contentStack.spacing = 12
+        contentView.addSubview(contentStack)
+
+        mediaPagerView.delegate = self
+
+        contentStack.addArrangedSubview(headerView)
+        contentStack.addArrangedSubview(mediaPagerView)
+        contentStack.addArrangedSubview(actionRowView)
+        contentStack.addArrangedSubview(metaView)
+
+        NSLayoutConstraint.activate([
+            contentStack.topAnchor.constraint(equalTo: contentView.topAnchor),
+            contentStack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            contentStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            contentStack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -12)
+        ])
+
+        mediaHeightConstraint = mediaPagerView.heightAnchor.constraint(equalToConstant: 300)
+        mediaHeightConstraint?.isActive = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        post = nil
+        currentTransitionContent = nil
+        headerView.prepareForReuse()
+        mediaPagerView.prepareForReuse()
+        contentView.transform = .identity
+    }
+
+    func configure(post: InstagramPost, chromeAlpha: CGFloat) {
+        self.post = post
+
+        headerView.configure(post: post)
+        actionRowView.configure(post: post)
+        metaView.configure(post: post)
+        mediaPagerView.configure(postID: post.id, media: post.media, isCurrentVisible: false)
+
+        let mediaHeight = Self.mediaHeight(for: post, width: bounds.width > 0 ? bounds.width : UIScreen.main.bounds.width)
+        mediaHeightConstraint?.constant = mediaHeight
+
+        setChromeAlpha(chromeAlpha)
+        currentTransitionContent = mediaPagerView.currentTransitionContent
+    }
+
+    func setCurrentVisible(_ isCurrentVisible: Bool) {
+        mediaPagerView.setCurrentVisible(isCurrentVisible)
+        currentTransitionContent = mediaPagerView.currentTransitionContent
+    }
+
+    func setChromeAlpha(_ alpha: CGFloat) {
+        headerView.alpha = alpha
+        actionRowView.alpha = alpha
+        metaView.alpha = alpha
+    }
+
+    func currentTransitionFrameInWindow() -> CGRect? {
+        mediaPagerView.currentMediaFrameInWindow()
+    }
+
+    static func height(for post: InstagramPost, width: CGFloat) -> CGFloat {
+        let mediaHeight = mediaHeight(for: post, width: width)
+        let contentWidth = max(width - 28, 1)
+        let captionHeight = textHeight(
+            text: "\(post.author.username) \(post.caption)",
+            width: contentWidth,
+            font: .systemFont(ofSize: 14),
+            maxLines: 3
+        )
+
+        var metaHeight: CGFloat = 0
+        metaHeight += 17
+        metaHeight += 6
+        metaHeight += captionHeight
+
+        if post.metrics.commentCount > 0 {
+            metaHeight += 6 + 17
+        }
+
+        if post.isSponsored, post.sponsorName != nil {
+            metaHeight += 6 + 16
+        }
+
+        metaHeight += 6 + 15
+
+        let headerHeight: CGFloat = post.locationName == nil ? 34 : 38
+        return 12 + headerHeight + 12 + mediaHeight + 12 + 24 + 12 + metaHeight + 12
+    }
+
+    private static func mediaHeight(for post: InstagramPost, width: CGFloat) -> CGFloat {
+        guard let firstMedia = post.media.first else {
+            return width
+        }
+
+        return width / clampedAspectRatio(for: firstMedia)
+    }
+
+    private static func textHeight(text: String, width: CGFloat, font: UIFont, maxLines: Int) -> CGFloat {
+        let boundingRect = NSString(string: text).boundingRect(
+            with: CGSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: font],
+            context: nil
+        )
+
+        let lineHeight = font.lineHeight
+        return min(ceil(boundingRect.height), lineHeight * CGFloat(maxLines))
+    }
+}
+
+extension FeedPostCell: FeedMediaPagerViewDelegate {
+    func feedMediaPagerViewDidUpdateVisibleMedia(_ view: FeedMediaPagerView) {
+        currentTransitionContent = view.currentTransitionContent
+        delegate?.feedPostCellDidUpdateVisibleMedia(self)
+    }
+}
+
+private final class FeedPostHeaderView: UIView {
+    private let avatarView = RemoteImageView()
+    private let usernameLabel = UILabel()
+    private let verifiedImageView = UIImageView(image: UIImage(systemName: "checkmark.seal.fill"))
+    private let locationLabel = UILabel()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+
+        translatesAutoresizingMaskIntoConstraints = false
+
+        avatarView.translatesAutoresizingMaskIntoConstraints = false
+        avatarView.layer.cornerRadius = 17
+        avatarView.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+
+        usernameLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        usernameLabel.textColor = .white
+
+        verifiedImageView.tintColor = AppTheme.verifiedBlue
+        verifiedImageView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 12, weight: .regular)
+
+        locationLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        locationLabel.textColor = AppTheme.secondaryTextColor
+
+        let usernameRow = UIStackView(arrangedSubviews: [usernameLabel, verifiedImageView])
+        usernameRow.axis = .horizontal
+        usernameRow.alignment = .center
+        usernameRow.spacing = 4
+
+        let labelsStack = UIStackView(arrangedSubviews: [usernameRow, locationLabel])
+        labelsStack.axis = .vertical
+        labelsStack.alignment = .leading
+        labelsStack.spacing = 2
+
+        let ellipsisImageView = UIImageView(image: UIImage(systemName: "ellipsis"))
+        ellipsisImageView.tintColor = .white
+        ellipsisImageView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+
+        let contentStack = UIStackView(arrangedSubviews: [avatarView, labelsStack, UIView(), ellipsisImageView])
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        contentStack.axis = .horizontal
+        contentStack.alignment = .center
+        contentStack.spacing = 10
+        addSubview(contentStack)
+
+        NSLayoutConstraint.activate([
+            avatarView.widthAnchor.constraint(equalToConstant: 34),
+            avatarView.heightAnchor.constraint(equalToConstant: 34),
+
+            contentStack.topAnchor.constraint(equalTo: topAnchor),
+            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            contentStack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configure(post: InstagramPost) {
+        avatarView.setImageURL(post.author.avatarURL)
+        usernameLabel.text = post.author.username
+        verifiedImageView.isHidden = post.author.isVerified == false
+        locationLabel.text = post.locationName
+        locationLabel.isHidden = post.locationName == nil
+    }
+
+    func prepareForReuse() {
+        avatarView.cancelImageLoad()
+    }
+}
+
+protocol FeedMediaPagerViewDelegate: AnyObject {
+    func feedMediaPagerViewDidUpdateVisibleMedia(_ view: FeedMediaPagerView)
+}
+
+final class FeedMediaPagerView: UIView {
+    weak var delegate: FeedMediaPagerViewDelegate?
+
+    private let collectionView: UICollectionView
+    private let pageLabel = UILabel()
+
+    private var postID: String?
+    private var media: [InstagramMedia] = []
+    private var currentPage = 0
+    private var isCurrentVisible = false
+
+    var currentTransitionContent: InstagramFeedTransitionContent? {
+        guard let postID,
+              media.indices.contains(currentPage)
+        else {
+            return nil
+        }
+
+        return InstagramFeedTransitionContent(postID: postID, media: media[currentPage])
+    }
+
+    override init(frame: CGRect) {
+        let layout = UICollectionViewFlowLayout()
+        layout.scrollDirection = .horizontal
+        layout.minimumLineSpacing = 0
+        layout.minimumInteritemSpacing = 0
+
+        collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
+
+        super.init(frame: frame)
+
+        backgroundColor = .black
+        clipsToBounds = true
+
+        collectionView.translatesAutoresizingMaskIntoConstraints = false
+        collectionView.backgroundColor = .clear
+        collectionView.isPagingEnabled = true
+        collectionView.showsHorizontalScrollIndicator = false
+        collectionView.dataSource = self
+        collectionView.delegate = self
+        collectionView.register(FeedMediaPageCell.self, forCellWithReuseIdentifier: FeedMediaPageCell.reuseIdentifier)
+        addSubview(collectionView)
+
+        pageLabel.translatesAutoresizingMaskIntoConstraints = false
+        pageLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        pageLabel.textColor = .white
+        pageLabel.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        pageLabel.layer.cornerRadius = 14
+        pageLabel.layer.masksToBounds = true
+        pageLabel.textAlignment = .center
+        addSubview(pageLabel)
+
+        NSLayoutConstraint.activate([
+            collectionView.topAnchor.constraint(equalTo: topAnchor),
+            collectionView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            collectionView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            collectionView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            pageLabel.topAnchor.constraint(equalTo: topAnchor, constant: 12),
+            pageLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            pageLabel.heightAnchor.constraint(equalToConstant: 28),
+            pageLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 46)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+
+        if let layout = collectionView.collectionViewLayout as? UICollectionViewFlowLayout,
+           layout.itemSize != bounds.size {
+            layout.itemSize = bounds.size
+            layout.invalidateLayout()
+        }
+    }
+
+    func configure(postID: String, media: [InstagramMedia], isCurrentVisible: Bool) {
+        self.postID = postID
+        self.media = media
+        self.isCurrentVisible = isCurrentVisible
+        currentPage = min(currentPage, max(media.count - 1, 0))
+        collectionView.setContentOffset(CGPoint(x: bounds.width * CGFloat(currentPage), y: 0), animated: false)
+        collectionView.reloadData()
+        updatePageLabel()
+    }
+
+    func setCurrentVisible(_ isCurrentVisible: Bool) {
+        self.isCurrentVisible = isCurrentVisible
+        updateVisiblePageActivity()
+        delegate?.feedMediaPagerViewDidUpdateVisibleMedia(self)
+    }
+
+    func currentMediaFrameInWindow() -> CGRect? {
+        window.map { convert(bounds, to: $0) }
+    }
+
+    func prepareForReuse() {
+        postID = nil
+        media = []
+        currentPage = 0
+        isCurrentVisible = false
+        collectionView.setContentOffset(.zero, animated: false)
+        collectionView.reloadData()
+    }
+
+    private func updatePageLabel() {
+        pageLabel.isHidden = media.count <= 1
+        pageLabel.text = "\(currentPage + 1)/\(max(media.count, 1))"
+    }
+
+    private func updateVisiblePageActivity() {
+        for cell in collectionView.visibleCells {
+            guard let mediaCell = cell as? FeedMediaPageCell,
+                  let indexPath = collectionView.indexPath(for: mediaCell)
+            else {
+                continue
+            }
+
+            mediaCell.setActive(isCurrentVisible && indexPath.item == currentPage)
+        }
+    }
+
+    private func syncCurrentPage() {
+        let width = max(collectionView.bounds.width, 1)
+        currentPage = min(max(Int(round(collectionView.contentOffset.x / width)), 0), max(media.count - 1, 0))
+        updatePageLabel()
+        updateVisiblePageActivity()
+        delegate?.feedMediaPagerViewDidUpdateVisibleMedia(self)
+    }
+}
+
+extension FeedMediaPagerView: UICollectionViewDataSource, UICollectionViewDelegateFlowLayout {
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
+        media.count
+    }
+
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        guard let cell = collectionView.dequeueReusableCell(
+            withReuseIdentifier: FeedMediaPageCell.reuseIdentifier,
+            for: indexPath
+        ) as? FeedMediaPageCell else {
+            return UICollectionViewCell()
+        }
+
+        cell.configure(media: media[indexPath.item], isActive: isCurrentVisible && indexPath.item == currentPage)
+        return cell
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        syncCurrentPage()
+    }
+
+    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        if decelerate == false {
+            syncCurrentPage()
+        }
+    }
+
+    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+        syncCurrentPage()
+    }
+}
+
+private final class FeedMediaPageCell: UICollectionViewCell {
+    static let reuseIdentifier = "FeedMediaPageCell"
+
+    private let imageView = RemoteImageView()
+    private let playFallbackView = UIImageView(image: UIImage(systemName: "play.circle.fill"))
+    private let videoPlayerView = FeedInlineVideoPlayerView()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+
+        contentView.backgroundColor = .black
+
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.backgroundColor = UIColor.white.withAlphaComponent(0.05)
+        contentView.addSubview(imageView)
+
+        videoPlayerView.translatesAutoresizingMaskIntoConstraints = false
+        videoPlayerView.isHidden = true
+        contentView.addSubview(videoPlayerView)
+
+        playFallbackView.translatesAutoresizingMaskIntoConstraints = false
+        playFallbackView.tintColor = UIColor.white.withAlphaComponent(0.92)
+        playFallbackView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 54, weight: .regular)
+        playFallbackView.isHidden = true
+        contentView.addSubview(playFallbackView)
+
+        NSLayoutConstraint.activate([
+            imageView.topAnchor.constraint(equalTo: contentView.topAnchor),
+            imageView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            imageView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            imageView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+
+            videoPlayerView.topAnchor.constraint(equalTo: contentView.topAnchor),
+            videoPlayerView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            videoPlayerView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            videoPlayerView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+
+            playFallbackView.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+            playFallbackView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        imageView.cancelImageLoad()
+        videoPlayerView.reset()
+        playFallbackView.isHidden = true
+    }
+
+    func configure(media: InstagramMedia, isActive: Bool) {
+        imageView.setImageURL(media.thumbnailURL ?? media.mediaURL)
+        accessibilityLabel = media.altText
+
+        if media.type == .video, let playbackURL = InstagramMediaPlaybackResolver().playbackURL(for: media) {
+            videoPlayerView.isHidden = false
+            playFallbackView.isHidden = true
+            videoPlayerView.configure(url: playbackURL, isActive: isActive)
+        } else if media.type == .video {
+            videoPlayerView.reset()
+            videoPlayerView.isHidden = true
+            playFallbackView.isHidden = false
+        } else {
+            videoPlayerView.reset()
+            videoPlayerView.isHidden = true
+            playFallbackView.isHidden = true
+        }
+    }
+
+    func setActive(_ isActive: Bool) {
+        videoPlayerView.setActive(isActive)
+    }
+}
+
+private final class FeedInlineVideoPlayerView: UIView {
+    private let playerContainerView = FeedPlayerContainerView()
+    private let activityIndicator = UIActivityIndicatorView(style: .medium)
+    private let muteButton = UIButton(type: .system)
+
+    private var playbackController: FeedVideoPlaybackController?
+    private var currentURL: URL?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+
+        clipsToBounds = true
+
+        playerContainerView.translatesAutoresizingMaskIntoConstraints = false
+        playerContainerView.playerLayer.videoGravity = .resizeAspectFill
+        addSubview(playerContainerView)
+
+        activityIndicator.translatesAutoresizingMaskIntoConstraints = false
+        activityIndicator.color = .white
+        addSubview(activityIndicator)
+
+        muteButton.translatesAutoresizingMaskIntoConstraints = false
+        muteButton.tintColor = .white
+        muteButton.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        muteButton.layer.cornerRadius = 17
+        muteButton.addAction(UIAction { [weak self] _ in
+            self?.playbackController?.toggleMuted()
+        }, for: .touchUpInside)
+        addSubview(muteButton)
+
+        NSLayoutConstraint.activate([
+            playerContainerView.topAnchor.constraint(equalTo: topAnchor),
+            playerContainerView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            playerContainerView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            playerContainerView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            activityIndicator.centerXAnchor.constraint(equalTo: centerXAnchor),
+            activityIndicator.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            muteButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            muteButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
+            muteButton.widthAnchor.constraint(equalToConstant: 34),
+            muteButton.heightAnchor.constraint(equalToConstant: 34)
+        ])
+
+        updateUI(isReadyToDisplay: false, isMuted: true)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configure(url: URL, isActive: Bool) {
+        if currentURL != url {
+            playbackController = FeedVideoPlaybackController(url: url)
+            playbackController?.onStateChange = { [weak self] controller in
+                self?.updateUI(isReadyToDisplay: controller.isReadyToDisplay, isMuted: controller.isMuted)
+            }
+            playerContainerView.playerLayer.player = playbackController?.player
+            currentURL = url
+        }
+
+        playbackController?.setActive(isActive)
+        updateUI(
+            isReadyToDisplay: playbackController?.isReadyToDisplay ?? false,
+            isMuted: playbackController?.isMuted ?? true
+        )
+    }
+
+    func setActive(_ active: Bool) {
+        playbackController?.setActive(active)
+    }
+
+    func reset() {
+        playbackController?.setActive(false)
+        playbackController = nil
+        currentURL = nil
+        playerContainerView.playerLayer.player = nil
+        updateUI(isReadyToDisplay: false, isMuted: true)
+    }
+
+    private func updateUI(isReadyToDisplay: Bool, isMuted: Bool) {
+        playerContainerView.alpha = isReadyToDisplay ? 1 : 0.001
+        isReadyToDisplay ? activityIndicator.stopAnimating() : activityIndicator.startAnimating()
+        muteButton.setImage(
+            UIImage(systemName: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill"),
+            for: .normal
+        )
+    }
+}
+
+private final class FeedVideoPlaybackController {
     let player: AVPlayer
 
-    @Published private(set) var isMuted = true
-    @Published private(set) var isReadyToDisplay = false
+    private(set) var isMuted = true
+    private(set) var isReadyToDisplay = false
+    var onStateChange: ((FeedVideoPlaybackController) -> Void)?
 
     private var isActive = false
+    private var statusObservation: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
-    private var cancellables = Set<AnyCancellable>()
 
     init(url: URL) {
         let playerItem = AVPlayerItem(url: url)
         playerItem.preferredForwardBufferDuration = 2
         playerItem.canUseNetworkResourcesForLiveStreamingWhilePaused = false
 
-        self.player = AVPlayer(playerItem: playerItem)
-        self.player.isMuted = true
-        self.player.actionAtItemEnd = .none
-        self.player.automaticallyWaitsToMinimizeStalling = true
+        player = AVPlayer(playerItem: playerItem)
+        player.isMuted = true
+        player.actionAtItemEnd = .none
+        player.automaticallyWaitsToMinimizeStalling = true
 
-        playerItem.publisher(for: \.status)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] status in
-                self?.isReadyToDisplay = status == .readyToPlay
+        statusObservation = playerItem.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            guard let self else {
+                return
             }
-            .store(in: &cancellables)
 
-        self.endObserver = NotificationCenter.default.addObserver(
+            self.isReadyToDisplay = item.status == .readyToPlay
+            DispatchQueue.main.async {
+                self.onStateChange?(self)
+            }
+        }
+
+        endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: player.currentItem,
             queue: .main
@@ -565,12 +929,9 @@ private final class FeedVideoPlaybackController: ObservableObject {
                 return
             }
 
-            Task { @MainActor in
-                self.player.seek(to: .zero)
-
-                if self.isActive {
-                    self.player.play()
-                }
+            self.player.seek(to: .zero)
+            if self.isActive {
+                self.player.play()
             }
         }
     }
@@ -580,6 +941,7 @@ private final class FeedVideoPlaybackController: ObservableObject {
             NotificationCenter.default.removeObserver(endObserver)
         }
 
+        statusObservation?.invalidate()
         player.pause()
     }
 
@@ -596,21 +958,7 @@ private final class FeedVideoPlaybackController: ObservableObject {
     func toggleMuted() {
         isMuted.toggle()
         player.isMuted = isMuted
-    }
-}
-
-private struct FeedPlayerLayer: UIViewRepresentable {
-    let player: AVPlayer
-
-    func makeUIView(context: Context) -> FeedPlayerContainerView {
-        let view = FeedPlayerContainerView()
-        view.playerLayer.videoGravity = .resizeAspectFill
-        view.playerLayer.player = player
-        return view
-    }
-
-    func updateUIView(_ uiView: FeedPlayerContainerView, context: Context) {
-        uiView.playerLayer.player = player
+        onStateChange?(self)
     }
 }
 
@@ -620,114 +968,150 @@ private final class FeedPlayerContainerView: UIView {
     }
 
     var playerLayer: AVPlayerLayer {
-        guard let playerLayer = layer as? AVPlayerLayer else {
-            fatalError("Expected AVPlayerLayer backing for FeedPlayerContainerView.")
+        guard let layer = layer as? AVPlayerLayer else {
+            fatalError("Expected AVPlayerLayer backing.")
         }
 
-        return playerLayer
+        return layer
     }
 }
 
-private struct FeedPostOffsetPreferenceKey: PreferenceKey {
-    static var defaultValue: [String: CGFloat] = [:]
+private final class FeedActionRowView: UIView {
+    private let heartView = UIImageView()
+    private let commentView = UIImageView(image: UIImage(systemName: "bubble.right"))
+    private let shareView = UIImageView(image: UIImage(systemName: "paperplane"))
+    private let bookmarkView = UIImageView()
 
-    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
-    }
-}
+    override init(frame: CGRect) {
+        super.init(frame: frame)
 
-private struct FeedVisibleMediaFramePreferenceKey: PreferenceKey {
-    static var defaultValue: [String: CGRect] = [:]
-
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
-    }
-}
-
-private struct FeedCircularAsyncImage: View {
-    let url: URL?
-
-    var body: some View {
-        CachedAsyncImage(url: url) { phase in
-            switch phase {
-            case let .success(image):
-                image
-                    .resizable()
-                    .scaledToFit()
-
-            case .empty:
-                Circle()
-                    .fill(Color.white.opacity(0.08))
-                    .overlay {
-                        ProgressView()
-                            .tint(.white)
-                    }
-
-            case .failure:
-                Circle()
-                    .fill(Color.white.opacity(0.1))
-                    .overlay {
-                        Image(systemName: "person.fill")
-                            .foregroundStyle(.white.opacity(0.7))
-                    }
-
-            @unknown default:
-                Circle()
-                    .fill(Color.white.opacity(0.1))
-            }
+        [heartView, commentView, shareView, bookmarkView].forEach {
+            $0.tintColor = .white
+            $0.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 22, weight: .regular)
         }
-        .clipShape(Circle())
+
+        let leftStack = UIStackView(arrangedSubviews: [heartView, commentView, shareView])
+        leftStack.axis = .horizontal
+        leftStack.alignment = .center
+        leftStack.spacing = 16
+
+        let contentStack = UIStackView(arrangedSubviews: [leftStack, UIView(), bookmarkView])
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        contentStack.axis = .horizontal
+        contentStack.alignment = .center
+        addSubview(contentStack)
+
+        NSLayoutConstraint.activate([
+            contentStack.topAnchor.constraint(equalTo: topAnchor),
+            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            contentStack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configure(post: InstagramPost) {
+        heartView.image = UIImage(systemName: post.isLikedByCurrentUser ? "heart.fill" : "heart")
+        heartView.tintColor = post.isLikedByCurrentUser ? .systemRed : .white
+        bookmarkView.image = UIImage(systemName: post.isSavedByCurrentUser ? "bookmark.fill" : "bookmark")
+        bookmarkView.tintColor = .white
     }
 }
 
-private struct FeedRectangularAsyncImage: View {
-    let url: URL?
+private final class FeedMetaView: UIView {
+    private let likesLabel = UILabel()
+    private let captionLabel = UILabel()
+    private let commentsLabel = UILabel()
+    private let sponsoredLabel = UILabel()
+    private let timestampLabel = UILabel()
+    private let stack = UIStackView()
 
-    var body: some View {
-        CachedAsyncImage(url: url) { phase in
-            switch phase {
-            case let .success(image):
-                image
-                    .resizable()
-                    .scaledToFill()
+    override init(frame: CGRect) {
+        super.init(frame: frame)
 
-            case .empty:
-                ZStack {
-                    Color.white.opacity(0.05)
+        likesLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        likesLabel.textColor = .white
 
-                    ProgressView()
-                        .tint(.white)
-                }
+        captionLabel.font = .systemFont(ofSize: 14, weight: .regular)
+        captionLabel.textColor = .white
+        captionLabel.numberOfLines = 3
 
-            case .failure:
-                LinearGradient(
-                    colors: [Color.white.opacity(0.08), Color.white.opacity(0.18)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                .overlay {
-                    Image(systemName: "photo")
-                        .font(.system(size: 26))
-                        .foregroundStyle(.white.opacity(0.75))
-                }
+        commentsLabel.font = .systemFont(ofSize: 14, weight: .medium)
+        commentsLabel.textColor = AppTheme.secondaryTextColor
 
-            @unknown default:
-                Color.white.opacity(0.05)
-            }
-        }
+        sponsoredLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        sponsoredLabel.textColor = AppTheme.secondaryTextColor
+
+        timestampLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        timestampLabel.textColor = AppTheme.secondaryTextColor
+
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.axis = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.addArrangedSubview(likesLabel)
+        stack.addArrangedSubview(captionLabel)
+        stack.addArrangedSubview(commentsLabel)
+        stack.addArrangedSubview(sponsoredLabel)
+        stack.addArrangedSubview(timestampLabel)
+        addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
     }
-}
 
-struct InstagramPostFeedScreen_Previews: PreviewProvider {
-    static var previews: some View {
-        InstagramPostFeedScreen(
-            title: "Posts",
-            posts: Array(MockInstagramDataset.posts.prefix(6)),
-            initialPostID: MockInstagramDataset.samplePost.id,
-            visiblePostID: .constant(MockInstagramDataset.samplePost.id),
-            visibleTransitionContent: .constant(nil),
-            visibleTransitionFrame: .constant(nil),
-            onClose: {}
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configure(post: InstagramPost) {
+        likesLabel.text = "\(post.metrics.likeCount.formatted()) likes"
+
+        let captionText = NSMutableAttributedString(
+            string: "\(post.author.username) ",
+            attributes: [
+                .font: UIFont.systemFont(ofSize: 14, weight: .semibold),
+                .foregroundColor: UIColor.white
+            ]
         )
+        captionText.append(
+            NSAttributedString(
+                string: post.caption,
+                attributes: [
+                    .font: UIFont.systemFont(ofSize: 14, weight: .regular),
+                    .foregroundColor: UIColor.white
+                ]
+            )
+        )
+        captionLabel.attributedText = captionText
+
+        commentsLabel.isHidden = post.metrics.commentCount == 0
+        commentsLabel.text = "View all \(post.metrics.commentCount.formatted()) comments"
+
+        if post.isSponsored, let sponsorName = post.sponsorName {
+            sponsoredLabel.isHidden = false
+            sponsoredLabel.text = "Sponsored • \(sponsorName)"
+        } else {
+            sponsoredLabel.isHidden = true
+            sponsoredLabel.text = nil
+        }
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d, yyyy"
+        timestampLabel.text = formatter.string(from: post.createdAt).uppercased()
     }
+}
+
+private func clampedAspectRatio(for media: InstagramMedia) -> CGFloat {
+    let ratio = CGFloat(media.width) / CGFloat(max(media.height, 1))
+    return min(max(ratio, 0.5625), 1.0)
 }

@@ -6,91 +6,81 @@
 //
 
 import CryptoKit
-import Combine
 import Foundation
-import SwiftUI
 import UIKit
 
-enum CachedAsyncImagePhase {
-    case empty
-    case success(Image)
-    case failure
-}
-
-struct CachedAsyncImage<Content: View>: View {
-    let url: URL?
-
-    private let content: (CachedAsyncImagePhase) -> Content
-
-    @StateObject private var loader: CachedAsyncImageLoader
-
-    init(
-        url: URL?,
-        @ViewBuilder content: @escaping (CachedAsyncImagePhase) -> Content
-    ) {
-        self.url = url
-        self.content = content
-        _loader = StateObject(wrappedValue: CachedAsyncImageLoader())
-    }
-
-    var body: some View {
-        content(loader.phase)
-            .task(id: url) {
-                await loader.load(from: url)
-            }
-    }
-}
-
-@MainActor
-private final class CachedAsyncImageLoader: ObservableObject {
-    @Published private(set) var phase: CachedAsyncImagePhase = .empty
-
-    private var requestedURL: URL?
+final class RemoteImageView: UIImageView {
+    private var loadTask: Task<Void, Never>?
     private var loadedURL: URL?
+    private var currentURL: URL?
 
-    init() {}
+    var onLoadStateChange: ((Bool) -> Void)?
 
-    func load(from url: URL?) async {
-        requestedURL = url
+    override init(frame: CGRect = .zero) {
+        super.init(frame: frame)
+        clipsToBounds = true
+        contentMode = .scaleAspectFill
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func setImageURL(_ url: URL?, placeholder: UIImage? = nil) {
+        loadTask?.cancel()
+        currentURL = url
+        loadedURL = nil
+        image = placeholder
+        onLoadStateChange?(true)
 
         guard let url else {
-            loadedURL = nil
-            phase = .failure
+            onLoadStateChange?(false)
             return
         }
 
-        if loadedURL == url, case .success = phase {
-            return
+        loadTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+
+            do {
+                let data = try await RemoteImageCache.shared.data(for: url)
+                try Task.checkCancellation()
+
+                guard currentURL == url else {
+                    return
+                }
+
+                let decodedImage = UIImage(data: data)?.preparingForDisplay() ?? UIImage(data: data)
+
+                await MainActor.run {
+                    guard self.currentURL == url else {
+                        return
+                    }
+
+                    self.loadedURL = url
+                    self.image = decodedImage
+                    self.onLoadStateChange?(false)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                await MainActor.run {
+                    guard self.currentURL == url else {
+                        return
+                    }
+
+                    self.loadedURL = nil
+                    self.onLoadStateChange?(false)
+                }
+            }
         }
+    }
 
-        phase = .empty
-
-        do {
-            let data = try await RemoteImageCache.shared.data(for: url)
-            try Task.checkCancellation()
-
-            guard requestedURL == url else {
-                return
-            }
-
-            guard let image = UIImage(data: data) else {
-                loadedURL = nil
-                phase = .failure
-                return
-            }
-
-            loadedURL = url
-            phase = .success(Image(uiImage: image.preparingForDisplay() ?? image))
-        } catch is CancellationError {
-            return
-        } catch {
-            guard requestedURL == url else {
-                return
-            }
-
-            loadedURL = nil
-            phase = .failure
-        }
+    func cancelImageLoad() {
+        loadTask?.cancel()
+        loadTask = nil
     }
 }
 

@@ -5,13 +5,7 @@
 //  Created by Ravi Bishnoi on 26/03/26.
 //
 
-import SwiftUI
+import UIKit
 
 @main
-struct insta_reelsApp: App {
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-        }
-    }
-}
+final class AppDelegate: UIResponder, UIApplicationDelegate {}

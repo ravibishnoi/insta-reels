@@ -98,8 +98,8 @@ struct InstagramPost: Identifiable, Codable, Hashable {
 }
 
 enum MockInstagramDataset {
-    private static let resourceName = "MockInstagramPosts"
-    private static let resourceExtension = "json"
+    nonisolated(unsafe) private static let resourceName = "MockInstagramPosts"
+    nonisolated(unsafe) private static let resourceExtension = "json"
 
     static let posts: [InstagramPost] = loadPosts()
 
